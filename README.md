@@ -10,6 +10,9 @@
 [![spotatui Contributors](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/LargeModGames/spotatui/main/.all-contributorsrc&query=%24.contributors.length&label=spotatui%20contributors&color=1ed760&style=flat-square)](#spotatui-contributors)
 [![Upstream Contributors](https://img.shields.io/badge/upstream_contributors-94-orange.svg?style=flat-square)](#upstream-contributors-spotify-tui)
 
+[![oosmetrics](https://api.oosmetrics.com/api/v1/badge/achievement/ccff995e-61d7-4ede-96ed-8e7fa0e48515.svg)](https://oosmetrics.com/repo/LargeModGames/spotatui)
+
+
 
 ![Demo](.github/demo.gif)
 
@@ -23,27 +26,30 @@
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 ## Table of Contents
 
-- [Help Wanted](#help-wanted)
-- [Performance](#performance)
-- [Privacy Notice](#privacy-notice)
-- [Migrating from spotify-tui](#migrating-from-spotify-tui)
-- [Installation](#installation)
-- [Connecting to Spotify](#connecting-to-spotify)
-- [Usage](#usage)
-- [Native Streaming](#native-streaming)
-- [Configuration](#configuration)
-  - [Discord Rich Presence](#discord-rich-presence)
-- [Limitations](#limitations)
-  - [Deprecated Spotify API Features](#deprecated-spotify-api-features)
-- [Using with spotifyd](#using-with-spotifyd)
-- [Libraries used](#libraries-used)
-- [Development](#development)
-  - [Windows Subsystem for Linux](#windows-subsystem-for-linux)
-- [Maintainer](#maintainer)
-- [spotatui Contributors](#spotatui-contributors)
-- [Upstream Contributors (spotify-tui)](#upstream-contributors-spotify-tui)
-- [Star History](#star-history)
-- [Roadmap](#roadmap)
+- [spotatui](#spotatui)
+  - [Song History](#song-history)
+  - [Table of Contents](#table-of-contents)
+  - [Help Wanted](#help-wanted)
+  - [Performance](#performance)
+  - [Privacy Notice](#privacy-notice)
+  - [Migrating from spotify-tui](#migrating-from-spotify-tui)
+  - [Installation](#installation)
+  - [Connecting to Spotify](#connecting-to-spotify)
+  - [Usage](#usage)
+  - [Native Streaming](#native-streaming)
+  - [Configuration](#configuration)
+    - [Discord Rich Presence](#discord-rich-presence)
+  - [Limitations](#limitations)
+    - [Deprecated Spotify API Features](#deprecated-spotify-api-features)
+  - [Using with spotifyd](#using-with-spotifyd)
+  - [Libraries used](#libraries-used)
+  - [Development](#development)
+    - [Windows Subsystem for Linux](#windows-subsystem-for-linux)
+  - [Maintainer](#maintainer)
+  - [spotatui Contributors](#spotatui-contributors)
+  - [Upstream Contributors (spotify-tui)](#upstream-contributors-spotify-tui)
+  - [Star History](#star-history)
+  - [Roadmap](#roadmap)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
