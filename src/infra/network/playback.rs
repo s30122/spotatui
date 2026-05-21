@@ -112,6 +112,23 @@ fn api_confirms_native_info_is_current(
     .is_some_and(|api_id| Some(api_id) == last_track_id)
 }
 
+#[cfg(feature = "streaming")]
+fn stale_api_item_should_preserve_native_context(
+  native_info_present: bool,
+  api_item_present: bool,
+  api_confirms_native_info: bool,
+  native_track_id_present: bool,
+  api_item_matches_native_track: bool,
+  native_streaming_was_active: bool,
+  native_activation_pending: bool,
+  api_device_is_native: bool,
+) -> bool {
+  api_item_present
+    && !api_confirms_native_info
+    && (native_info_present || (native_track_id_present && !api_item_matches_native_track))
+    && (native_streaming_was_active || native_activation_pending || api_device_is_native)
+}
+
 /// Get the currently active streaming player, if any.
 /// Note: This logic is duplicated in `main.rs` as `active_streaming_player()`.
 /// Both are identical; the difference is input type (Network vs. App Arc).
@@ -226,7 +243,20 @@ impl PlaybackNetwork for Network {
           }
         }
 
+        #[cfg(feature = "streaming")]
+        let native_streaming_was_active = app.is_streaming_active;
+        #[cfg(feature = "streaming")]
+        let native_activation_was_pending = app.native_activation_pending;
         let native_track_id_before_api = app.last_track_id.clone();
+        #[cfg(feature = "streaming")]
+        let native_track_id_present = native_track_id_before_api.is_some();
+        #[cfg(feature = "streaming")]
+        let api_item_matches_native_track = c
+          .item
+          .as_ref()
+          .and_then(playable_item_id)
+          .as_deref()
+          .is_some_and(|api_id| Some(api_id) == native_track_id_before_api.as_deref());
         let api_item_confirms_native_info = app
           .native_track_info
           .as_ref()
@@ -238,6 +268,18 @@ impl PlaybackNetwork for Network {
               native_track_id_before_api.as_deref(),
             )
           });
+        #[cfg(feature = "streaming")]
+        let stale_api_item_for_native = stale_api_item_should_preserve_native_context(
+          app.native_track_info.is_some(),
+          c.item.is_some(),
+          api_item_confirms_native_info,
+          native_track_id_present,
+          api_item_matches_native_track,
+          native_streaming_was_active,
+          native_activation_was_pending,
+          is_native_device,
+        );
+        #[cfg(not(feature = "streaming"))]
         let stale_api_item_for_native =
           app.native_track_info.is_some() && c.item.is_some() && !api_item_confirms_native_info;
 
@@ -321,35 +363,43 @@ impl PlaybackNetwork for Network {
           }
         }
 
-        // Get album/episode cover art
-        #[cfg(feature = "cover-art")]
-        if app
-          .user_config
-          .do_draw_cover_art(app.cover_art.full_image_support())
-        {
-          if let Some(playable) = &c.item {
-            let image = match playable {
-              PlayableItem::Track(t) => t.album.images.first(),
-              PlayableItem::Episode(e) => e.images.first(),
-              _ => None,
-            };
+        if !stale_api_item_for_native {
+          // Get album/episode cover art
+          #[cfg(feature = "cover-art")]
+          if app
+            .user_config
+            .do_draw_cover_art(app.cover_art.full_image_support())
+          {
+            if let Some(playable) = &c.item {
+              let image = match playable {
+                PlayableItem::Track(t) => t.album.images.first(),
+                PlayableItem::Episode(e) => e.images.first(),
+                _ => None,
+              };
 
-            if let Some(image) = image {
-              if let anyhow::Result::Err(err) = app.cover_art.refresh(image).await {
-                drop(app);
-                self.handle_error(err).await;
-                return;
+              if let Some(image) = image {
+                if let anyhow::Result::Err(err) = app.cover_art.refresh(image).await {
+                  drop(app);
+                  self.handle_error(err).await;
+                  return;
+                }
               }
             }
           }
-        }
 
-        app.current_playback_context = Some(c);
+          app.current_playback_context = Some(c);
+        }
 
         // Update is_streaming_active based on whether the current device matches native streaming
         #[cfg(feature = "streaming")]
         {
-          app.is_streaming_active = is_native_device;
+          if stale_api_item_for_native {
+            app.is_streaming_active = true;
+            app.native_activation_pending = false;
+          } else {
+            app.is_streaming_active = is_native_device;
+          }
+
           if is_native_device {
             app.native_activation_pending = false;
           }
@@ -359,7 +409,10 @@ impl PlaybackNetwork for Network {
         // Spotify's playback endpoint can lag behind librespot by several seconds
         // and report a different item; TrackChanged/Stopped events own this field.
         #[cfg(feature = "streaming")]
-        if app.native_track_info.is_some() && (!is_native_device || api_item_confirms_native_info) {
+        if app.native_track_info.is_some()
+          && !stale_api_item_for_native
+          && (!is_native_device || api_item_confirms_native_info)
+        {
           app.native_track_info = None;
         }
       }
@@ -1151,6 +1204,62 @@ mod tests {
       "New Native Song",
       &item,
       Some("0000000000000000000002")
+    ));
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn stale_api_item_keeps_native_metadata_when_native_was_active() {
+    assert!(stale_api_item_should_preserve_native_context(
+      true, true, false, true, false, true, false, false,
+    ));
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn stale_api_item_keeps_native_metadata_during_activation() {
+    assert!(stale_api_item_should_preserve_native_context(
+      true, true, false, true, false, false, true, false,
+    ));
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn stale_api_item_keeps_native_context_before_native_metadata_arrives() {
+    assert!(stale_api_item_should_preserve_native_context(
+      false, true, false, true, false, true, false, false,
+    ));
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn stale_native_metadata_clears_after_playback_leaves_native_device() {
+    assert!(!stale_api_item_should_preserve_native_context(
+      true, true, false, true, false, false, false, false,
+    ));
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn confirmed_api_item_no_longer_keeps_native_metadata() {
+    assert!(!stale_api_item_should_preserve_native_context(
+      true, true, true, true, true, true, false, true,
+    ));
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn matching_api_item_without_native_metadata_can_update_context() {
+    assert!(!stale_api_item_should_preserve_native_context(
+      false, true, false, true, true, true, false, false,
+    ));
+  }
+
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn api_item_without_native_track_id_can_update_context() {
+    assert!(!stale_api_item_should_preserve_native_context(
+      false, true, false, false, false, true, false, false,
     ));
   }
 }

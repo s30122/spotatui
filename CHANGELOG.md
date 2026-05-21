@@ -7,6 +7,7 @@
 - **Playbar cover art sizing**: Added configurable playbar cover art sizing and improved layout handling so the image, controls, and progress bar scale cleanly in the playbar ([#253](https://github.com/LargeModGames/spotatui/issues/253)).
 - **Mouse song selection**: Changed song-table left clicks so the first click highlights a row and a second click on the highlighted row selects/plays it, matching arrow-key plus Enter behavior ([#258](https://github.com/LargeModGames/spotatui/issues/258)).
 - **Startup playback hijacking**: Made the default `Continue` startup behavior passive so launching spotatui discovers devices without transferring playback to the native Spotatui Connect device ([#254](https://github.com/LargeModGames/spotatui/issues/254)).
+- **Native startup playbar metadata**: Kept native startup playback metadata authoritative while Spotify's playback API catches up, preventing the playbar from switching to an unrelated stale API track while the native player keeps playing the started song.
 
 ## [v0.38.2] - 2026-05-10
 
