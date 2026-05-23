@@ -1,15 +1,18 @@
-use super::requests::spotify_get_typed_compat_for;
 use super::{IoEvent, Network};
 use crate::tui::ui::util::create_artist_string;
 use anyhow::anyhow;
-use chrono::Duration as ChronoDuration;
 use chrono::TimeDelta;
+use reqwest::Method;
+#[cfg(feature = "streaming")]
+use rspotify::model::device::DevicePayload;
 use rspotify::model::{
+  context::CurrentUserQueue,
   enums::RepeatState,
   idtypes::{PlayContextId, PlayableId},
-  Offset, PlayableItem,
+  PlayableItem,
 };
 use rspotify::prelude::*;
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "streaming")]
@@ -71,15 +74,41 @@ fn trim_api_playback_uris(
   (trimmed_uris, Some(selected_index - start))
 }
 
-fn api_playback_offset(
+fn api_playback_offset_json(
   context_uris: Option<&[PlayableId<'static>]>,
   offset: Option<usize>,
-) -> Option<Offset> {
+) -> Option<Value> {
   if let Some(first_uri) = context_uris.and_then(|uris| uris.first()) {
-    return Some(Offset::Uri(first_uri.uri()));
+    return Some(json!({ "uri": first_uri.uri() }));
   }
 
-  offset.map(|index| Offset::Position(ChronoDuration::milliseconds(index as i64)))
+  offset.map(|index| json!({ "position": index }))
+}
+
+fn api_playback_body(
+  context_id: Option<&PlayContextId<'static>>,
+  uris: Option<&[PlayableId<'static>]>,
+  offset: Option<usize>,
+) -> Option<Value> {
+  match (context_id, uris) {
+    (Some(context), track_uris) => {
+      let mut body = json!({ "context_uri": context.uri() });
+      if let Some(offset) = api_playback_offset_json(track_uris, offset) {
+        body["offset"] = offset;
+      }
+      Some(body)
+    }
+    (None, Some(track_uris)) => {
+      let mut body = json!({
+        "uris": track_uris.iter().map(|uri| uri.uri()).collect::<Vec<_>>()
+      });
+      if let Some(offset) = api_playback_offset_json(None, offset) {
+        body["offset"] = offset;
+      }
+      Some(body)
+    }
+    (None, None) => None,
+  }
 }
 
 fn playable_item_id(item: &PlayableItem) -> Option<String> {
@@ -217,12 +246,12 @@ impl PlaybackNetwork for Network {
         None
       };
 
-    let context = spotify_get_typed_compat_for::<Option<rspotify::model::CurrentPlaybackContext>>(
-      &self.spotify,
-      "me/player",
-      &[("additional_types", "episode,track".to_string())],
-    )
-    .await;
+    let context = self
+      .spotify_get_typed::<Option<rspotify::model::CurrentPlaybackContext>>(
+        "me/player",
+        &[("additional_types", "episode,track".to_string())],
+      )
+      .await;
 
     let mut app = self.app.lock().await;
 
@@ -621,37 +650,22 @@ impl PlaybackNetwork for Network {
       }
     }
 
-    let result = match (context_id, uris) {
-      (Some(context), track_uris) => {
-        let offset_struct = api_playback_offset(track_uris.as_deref(), offset);
-        self
-          .spotify
-          .start_context_playback(
-            context,
-            None, // device_id
-            offset_struct,
-            None, // position
-          )
-          .await
-      }
-      (None, Some(track_uris)) => {
-        let offset_struct = api_playback_offset(None, offset);
-        self
-          .spotify
-          .start_uris_playback(
-            track_uris,
-            None, // device_id
-            offset_struct,
-            None, // position
-          )
-          .await
-      }
-      (None, None) => self.spotify.resume_playback(None, None).await,
-    };
+    let body = api_playback_body(context_id.as_ref(), uris.as_deref(), offset);
+    let result = self
+      .spotify_api_request_json(Method::PUT, "me/player/play", &[], body)
+      .await;
 
     match result {
       Ok(_) => {
-        if let Err(e) = self.spotify.shuffle(desired_shuffle_state, None).await {
+        if let Err(e) = self
+          .spotify_api_request_json(
+            Method::PUT,
+            "me/player/shuffle",
+            &[("state", desired_shuffle_state.to_string())],
+            None,
+          )
+          .await
+        {
           let mut app = self.app.lock().await;
           app.handle_error(anyhow!(e));
         }
@@ -685,7 +699,10 @@ impl PlaybackNetwork for Network {
       }
     }
 
-    match self.spotify.pause_playback(None).await {
+    match self
+      .spotify_api_request_json(Method::PUT, "me/player/pause", &[], None)
+      .await
+    {
       Ok(_) => {
         let mut app = self.app.lock().await;
         if let Some(ctx) = &mut app.current_playback_context {
@@ -708,7 +725,10 @@ impl PlaybackNetwork for Network {
       }
     }
 
-    if let Err(e) = self.spotify.next_track(None).await {
+    if let Err(e) = self
+      .spotify_api_request_json(Method::POST, "me/player/next", &[], None)
+      .await
+    {
       let mut app = self.app.lock().await;
       app.handle_error(anyhow!(e));
     }
@@ -723,7 +743,10 @@ impl PlaybackNetwork for Network {
       }
     }
 
-    if let Err(e) = self.spotify.previous_track(None).await {
+    if let Err(e) = self
+      .spotify_api_request_json(Method::POST, "me/player/previous", &[], None)
+      .await
+    {
       let mut app = self.app.lock().await;
       app.handle_error(anyhow!(e));
     }
@@ -743,7 +766,10 @@ impl PlaybackNetwork for Network {
     // First previous_track restarts the current track (if past Spotify's ~3s
     // threshold). After a short delay the second call actually skips to the
     // previous track, since the position is now back at 0.
-    if let Err(e) = self.spotify.previous_track(None).await {
+    if let Err(e) = self
+      .spotify_api_request_json(Method::POST, "me/player/previous", &[], None)
+      .await
+    {
       let mut app = self.app.lock().await;
       app.handle_error(anyhow!(e));
       return;
@@ -751,7 +777,10 @@ impl PlaybackNetwork for Network {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    if let Err(e) = self.spotify.previous_track(None).await {
+    if let Err(e) = self
+      .spotify_api_request_json(Method::POST, "me/player/previous", &[], None)
+      .await
+    {
       let mut app = self.app.lock().await;
       app.handle_error(anyhow!(e));
     }
@@ -767,8 +796,12 @@ impl PlaybackNetwork for Network {
     }
 
     if let Err(e) = self
-      .spotify
-      .seek_track(ChronoDuration::milliseconds(position_ms as i64), None)
+      .spotify_api_request_json(
+        Method::PUT,
+        "me/player/seek",
+        &[("position_ms", position_ms.to_string())],
+        None,
+      )
       .await
     {
       let mut app = self.app.lock().await;
@@ -789,7 +822,15 @@ impl PlaybackNetwork for Network {
       }
     }
 
-    match self.spotify.shuffle(shuffle_state, None).await {
+    match self
+      .spotify_api_request_json(
+        Method::PUT,
+        "me/player/shuffle",
+        &[("state", shuffle_state.to_string())],
+        None,
+      )
+      .await
+    {
       Ok(_) => {
         let mut app = self.app.lock().await;
         if let Some(ctx) = &mut app.current_playback_context {
@@ -816,7 +857,16 @@ impl PlaybackNetwork for Network {
       }
     }
 
-    match self.spotify.repeat(repeat_state, None).await {
+    let repeat_state_param: &'static str = repeat_state.into();
+    match self
+      .spotify_api_request_json(
+        Method::PUT,
+        "me/player/repeat",
+        &[("state", repeat_state_param.to_string())],
+        None,
+      )
+      .await
+    {
       Ok(_) => {
         let mut app = self.app.lock().await;
         if let Some(ctx) = &mut app.current_playback_context {
@@ -855,7 +905,15 @@ impl PlaybackNetwork for Network {
       }
     }
 
-    match self.spotify.volume(volume, None).await {
+    match self
+      .spotify_api_request_json(
+        Method::PUT,
+        "me/player/volume",
+        &[("volume_percent", volume.to_string())],
+        None,
+      )
+      .await
+    {
       Ok(_) => {
         let mut app = self.app.lock().await;
         if let Some(ctx) = &mut app.current_playback_context {
@@ -907,7 +965,18 @@ impl PlaybackNetwork for Network {
       }
     }
 
-    if let Err(e) = self.spotify.transfer_playback(&device_id, Some(true)).await {
+    if let Err(e) = self
+      .spotify_api_request_json(
+        Method::PUT,
+        "me/player",
+        &[],
+        Some(json!({
+          "device_ids": [device_id.clone()],
+          "play": true
+        })),
+      )
+      .await
+    {
       let mut app = self.app.lock().await;
       app.handle_error(anyhow!(e));
     } else {
@@ -968,9 +1037,13 @@ impl PlaybackNetwork for Network {
           tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
-        match self.spotify.device().await {
-          Ok(devices) => {
-            if let Some(device) = devices
+        match self
+          .spotify_get_typed::<DevicePayload>("me/player/devices", &[])
+          .await
+        {
+          Ok(payload) => {
+            if let Some(device) = payload
+              .devices
               .iter()
               .find(|d| d.name.to_lowercase() == device_name.to_lowercase())
             {
@@ -998,12 +1071,9 @@ impl PlaybackNetwork for Network {
     }
 
     // Check if we are paused/stopped
-    let context = spotify_get_typed_compat_for::<Option<rspotify::model::CurrentPlaybackContext>>(
-      &self.spotify,
-      "me/player",
-      &[],
-    )
-    .await;
+    let context = self
+      .spotify_get_typed::<Option<rspotify::model::CurrentPlaybackContext>>("me/player", &[])
+      .await;
 
     if let Ok(Some(ctx)) = context {
       if !ctx.is_playing {
@@ -1032,7 +1102,15 @@ impl PlaybackNetwork for Network {
   }
 
   async fn add_item_to_queue(&mut self, item: PlayableId<'static>) {
-    match self.spotify.add_item_to_queue(item, None).await {
+    match self
+      .spotify_api_request_json(
+        Method::POST,
+        "me/player/queue",
+        &[("uri", item.uri())],
+        None,
+      )
+      .await
+    {
       Ok(_) => {
         let mut app = self.app.lock().await;
         app.status_message = Some("Added to queue".to_string());
@@ -1046,7 +1124,10 @@ impl PlaybackNetwork for Network {
   }
 
   async fn get_queue(&mut self) {
-    match self.spotify.current_user_queue().await {
+    match self
+      .spotify_get_typed::<CurrentUserQueue>("me/player/queue", &[])
+      .await
+    {
       Ok(q) => {
         let mut app = self.app.lock().await;
         app.queue = Some(q);
@@ -1152,34 +1233,26 @@ mod tests {
       playable_track("0000000000000000000002"),
     ];
 
-    let offset = api_playback_offset(Some(&uris), Some(1));
+    let offset = api_playback_offset_json(Some(&uris), Some(1));
 
     assert_eq!(
       offset,
-      Some(Offset::Uri(
-        "spotify:track:0000000000000000000001".to_string()
-      ))
+      Some(json!({ "uri": "spotify:track:0000000000000000000001" }))
     );
   }
 
   #[test]
   fn api_playback_offset_uses_position_for_uri_list_playback() {
-    let offset = api_playback_offset(None, Some(1));
+    let offset = api_playback_offset_json(None, Some(1));
 
-    assert_eq!(
-      offset,
-      Some(Offset::Position(ChronoDuration::milliseconds(1)))
-    );
+    assert_eq!(offset, Some(json!({ "position": 1 })));
   }
 
   #[test]
   fn api_playback_offset_falls_back_to_position_when_context_has_no_uri() {
-    let offset = api_playback_offset(None, Some(3));
+    let offset = api_playback_offset_json(None, Some(3));
 
-    assert_eq!(
-      offset,
-      Some(Offset::Position(ChronoDuration::milliseconds(3)))
-    );
+    assert_eq!(offset, Some(json!({ "position": 3 })));
   }
 
   #[test]
