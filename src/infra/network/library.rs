@@ -275,8 +275,8 @@ impl Network {
       "me/library",
       &query,
       Some(json!({ "uris": uris })),
-      Some(&self.token_cache_path),
-      Some(&self.app),
+      &self.token_cache_path,
+      &self.app,
     )
     .await?;
     Ok(())
@@ -294,8 +294,8 @@ impl Network {
       "me/library",
       &query,
       Some(json!({ "uris": uris })),
-      Some(&self.token_cache_path),
-      Some(&self.app),
+      &self.token_cache_path,
+      &self.app,
     )
     .await?;
     Ok(())
@@ -775,8 +775,8 @@ impl LibraryNetwork for Network {
       &format!("playlists/{}/tracks", playlist_id.id()),
       &[],
       Some(body),
-      Some(&self.token_cache_path),
-      Some(&self.app),
+      &self.token_cache_path,
+      &self.app,
     )
     .await
     {
@@ -927,8 +927,8 @@ impl LibraryNetwork for Network {
       &create_path,
       &[],
       Some(create_body),
-      Some(&self.token_cache_path),
-      Some(&self.app),
+      &self.token_cache_path,
+      &self.app,
     )
     .await
     {
