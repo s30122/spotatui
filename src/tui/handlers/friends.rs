@@ -144,10 +144,8 @@ fn handle_add_dialog(key: Key, app: &mut App) {
       }
     }
 
-    k if app.friend_add_mode == FriendAddMode::Search && common_key_events::up_event(k) => {
-      if app.friend_user_search_selected > 0 {
-        app.friend_user_search_selected -= 1;
-      }
+    k if app.friend_add_mode == FriendAddMode::Search && common_key_events::up_event(k) && app.friend_user_search_selected > 0 => {
+      app.friend_user_search_selected -= 1;
     }
 
     Key::Char(c) if c != '\n' => match app.friend_add_mode {
