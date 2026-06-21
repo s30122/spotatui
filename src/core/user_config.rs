@@ -599,10 +599,6 @@ pub fn parse_key_public(key: String) -> Result<Key> {
 
 fn check_reserved_keys(key: Key) -> Result<()> {
   let reserved = [
-    Key::Char('h'),
-    Key::Char('j'),
-    Key::Char('k'),
-    Key::Char('l'),
     Key::Char('H'),
     Key::Char('M'),
     Key::Char('L'),
@@ -638,6 +634,10 @@ pub struct UserConfigPaths {
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KeyBindingsString {
   back: Option<String>,
+  move_up: Option<String>,
+  move_down: Option<String>,
+  move_left: Option<String>,
+  move_right: Option<String>,
   next_page: Option<String>,
   previous_page: Option<String>,
   jump_to_start: Option<String>,
@@ -678,6 +678,10 @@ pub struct KeyBindingsString {
 #[derive(Clone)]
 pub struct KeyBindings {
   pub back: Key,
+  pub move_up: Key,
+  pub move_down: Key,
+  pub move_left: Key,
+  pub move_right: Key,
   pub next_page: Key,
   pub previous_page: Key,
   pub jump_to_start: Key,
@@ -756,6 +760,7 @@ pub struct BehaviorConfigString {
   #[cfg(feature = "cover-art")]
   pub playbar_cover_art_size_percent: Option<u16>,
   pub keepawake_enabled: Option<bool>,
+  pub enable_media_keys: Option<bool>,
   pub sync_token: Option<String>,
 }
 
@@ -801,6 +806,10 @@ pub struct BehaviorConfig {
   #[cfg(feature = "cover-art")]
   pub playbar_cover_art_size_percent: u16,
   pub keepawake_enabled: bool,
+  /// When false, spotatui ignores OS media-control commands (headphone
+  /// play/pause/skip buttons, media keys, MPRIS/SMTC/Now Playing, playerctl).
+  /// It still publishes track metadata to the OS; it just stops reacting.
+  pub enable_media_keys: bool,
   pub sync_token: Option<String>,
 }
 
@@ -845,6 +854,10 @@ impl UserConfig {
       custom_theme: Default::default(),
       keys: KeyBindings {
         back: Key::Char('q'),
+        move_up: Key::Char('k'),
+        move_down: Key::Char('j'),
+        move_left: Key::Char('h'),
+        move_right: Key::Char('l'),
         next_page: Key::Ctrl('d'),
         previous_page: Key::Ctrl('u'),
         jump_to_start: Key::Ctrl('a'),
@@ -928,6 +941,7 @@ impl UserConfig {
         #[cfg(feature = "cover-art")]
         playbar_cover_art_size_percent: 100,
         keepawake_enabled: true,
+        enable_media_keys: true,
         sync_token: None,
       },
       path_to_config: None,
@@ -971,6 +985,10 @@ impl UserConfig {
     }
 
     to_keys!(back);
+    to_keys!(move_up);
+    to_keys!(move_down);
+    to_keys!(move_left);
+    to_keys!(move_right);
     to_keys!(next_page);
     to_keys!(previous_page);
     to_keys!(jump_to_start);
@@ -1276,6 +1294,9 @@ impl UserConfig {
     if let Some(keepawake_enabled) = behavior_config.keepawake_enabled {
       self.behavior.keepawake_enabled = keepawake_enabled;
     }
+    if let Some(enable_media_keys) = behavior_config.enable_media_keys {
+      self.behavior.enable_media_keys = enable_media_keys;
+    }
     Ok(())
   }
 
@@ -1283,6 +1304,10 @@ impl UserConfig {
     let k = &self.keys;
     vec![
       k.back,
+      k.move_up,
+      k.move_down,
+      k.move_left,
+      k.move_right,
       k.next_page,
       k.previous_page,
       k.jump_to_start,
@@ -1435,6 +1460,7 @@ impl UserConfig {
       #[cfg(feature = "cover-art")]
       playbar_cover_art_size_percent: Some(self.behavior.playbar_cover_art_size_percent),
       keepawake_enabled: Some(self.behavior.keepawake_enabled),
+      enable_media_keys: Some(self.behavior.enable_media_keys),
     };
 
     // Helper to convert Key to config string
@@ -1478,6 +1504,10 @@ impl UserConfig {
     // Helper to build keybindings config from current values
     let build_keybindings = || KeyBindingsString {
       back: Some(key_to_config_string(self.keys.back)),
+      move_up: Some(key_to_config_string(self.keys.move_up)),
+      move_down: Some(key_to_config_string(self.keys.move_down)),
+      move_left: Some(key_to_config_string(self.keys.move_left)),
+      move_right: Some(key_to_config_string(self.keys.move_right)),
       next_page: Some(key_to_config_string(self.keys.next_page)),
       previous_page: Some(key_to_config_string(self.keys.previous_page)),
       jump_to_start: Some(key_to_config_string(self.keys.jump_to_start)),
@@ -1901,10 +1931,10 @@ mod tests {
 
     let mut config = UserConfig::new();
     let mut entries = HashMap::new();
-    // 'j' is a reserved key
-    entries.insert("go_down".to_string(), "j".to_string());
+    // Enter is a reserved key
+    entries.insert("submit_action".to_string(), "enter".to_string());
     config.load_plugin_commands(entries);
-    assert!(!config.plugin_command_keys.contains_key(&Key::Char('j')));
+    assert!(!config.plugin_command_keys.contains_key(&Key::Enter));
   }
 
   #[test]

@@ -35,7 +35,16 @@ use std::{
 };
 
 use arboard::Clipboard;
+#[cfg(feature = "streaming")]
+use chrono::Utc;
 use log::info;
+#[cfg(feature = "streaming")]
+use rspotify::model::{
+  context::Actions,
+  device::Device,
+  enums::{CurrentlyPlayingType, RepeatState},
+  DeviceType,
+};
 
 pub const LIBRARY_OPTIONS: [&str; 7] = [
   "Discover",
@@ -2173,6 +2182,49 @@ impl App {
   }
 
   #[cfg(feature = "streaming")]
+  pub fn mark_native_streaming_device_available(
+    &mut self,
+    device_id: String,
+    device_name: String,
+    volume_percent: u8,
+  ) {
+    self.native_device_id = Some(device_id.clone());
+    self.is_streaming_active = true;
+    self.native_activation_pending = false;
+    self.native_is_playing = Some(false);
+
+    if self
+      .current_playback_context
+      .as_ref()
+      .and_then(|ctx| ctx.item.as_ref())
+      .is_some()
+    {
+      return;
+    }
+
+    self.current_playback_context = Some(CurrentPlaybackContext {
+      device: Device {
+        id: Some(device_id),
+        is_active: true,
+        is_private_session: false,
+        is_restricted: false,
+        name: device_name,
+        _type: DeviceType::Computer,
+        volume_percent: Some(u32::from(volume_percent)),
+      },
+      repeat_state: RepeatState::Off,
+      shuffle_state: self.user_config.behavior.shuffle_enabled,
+      context: None,
+      timestamp: Utc::now(),
+      progress: None,
+      is_playing: false,
+      item: None,
+      currently_playing_type: CurrentlyPlayingType::Unknown,
+      actions: Actions::default(),
+    });
+  }
+
+  #[cfg(feature = "streaming")]
   pub fn has_fresh_native_activity(&self) -> bool {
     self.native_track_info.is_some()
       || self.native_is_playing == Some(true)
@@ -2235,6 +2287,16 @@ impl App {
     // Use native streaming player for instant control (bypasses event channel latency)
     #[cfg(feature = "streaming")]
     if self.is_native_streaming_active_for_playback() {
+      if self
+        .current_playback_context
+        .as_ref()
+        .and_then(|ctx| ctx.item.as_ref())
+        .is_none()
+      {
+        self.dispatch(IoEvent::StartPlayback(None, None, None));
+        return;
+      }
+
       if let Some(ref player) = self.streaming_player {
         let is_playing = self
           .native_is_playing
@@ -3417,6 +3479,14 @@ impl App {
           value: SettingValue::Bool(self.user_config.behavior.keepawake_enabled),
         },
         SettingItem {
+          id: "behavior.enable_media_keys".to_string(),
+          name: "Media Key Controls".to_string(),
+          description:
+            "Let OS media keys, headphone buttons, and remote controls (playerctl, Now Playing) control playback"
+              .to_string(),
+          value: SettingValue::Bool(self.user_config.behavior.enable_media_keys),
+        },
+        SettingItem {
           id: "behavior.startup_behavior".to_string(),
           name: "Startup Behavior".to_string(),
           description: "Playback state when spotatui starts: continue, play, or pause".to_string(),
@@ -3530,6 +3600,30 @@ impl App {
           name: "Back".to_string(),
           description: "Go back / quit".to_string(),
           value: SettingValue::Key(key_to_string(&self.user_config.keys.back)),
+        },
+        SettingItem {
+          id: "keys.move_up".to_string(),
+          name: "Move Up".to_string(),
+          description: "Move selection up".to_string(),
+          value: SettingValue::Key(key_to_string(&self.user_config.keys.move_up)),
+        },
+        SettingItem {
+          id: "keys.move_down".to_string(),
+          name: "Move Down".to_string(),
+          description: "Move selection down".to_string(),
+          value: SettingValue::Key(key_to_string(&self.user_config.keys.move_down)),
+        },
+        SettingItem {
+          id: "keys.move_left".to_string(),
+          name: "Move Left".to_string(),
+          description: "Move selection left".to_string(),
+          value: SettingValue::Key(key_to_string(&self.user_config.keys.move_left)),
+        },
+        SettingItem {
+          id: "keys.move_right".to_string(),
+          name: "Move Right".to_string(),
+          description: "Move selection right".to_string(),
+          value: SettingValue::Key(key_to_string(&self.user_config.keys.move_right)),
         },
         SettingItem {
           id: "keys.next_page".to_string(),
@@ -3901,6 +3995,11 @@ impl App {
             self.user_config.behavior.keepawake_enabled = *v;
           }
         }
+        "behavior.enable_media_keys" => {
+          if let SettingValue::Bool(v) = &setting.value {
+            self.user_config.behavior.enable_media_keys = *v;
+          }
+        }
         "behavior.enable_announcements" => {
           if let SettingValue::Bool(v) = &setting.value {
             self.user_config.behavior.enable_announcements = *v;
@@ -3982,6 +4081,34 @@ impl App {
           if let SettingValue::Key(v) = &setting.value {
             if let Ok(key) = crate::core::user_config::parse_key_public(v.clone()) {
               self.user_config.keys.back = key;
+            }
+          }
+        }
+        "keys.move_up" => {
+          if let SettingValue::Key(v) = &setting.value {
+            if let Ok(key) = crate::core::user_config::parse_key_public(v.clone()) {
+              self.user_config.keys.move_up = key;
+            }
+          }
+        }
+        "keys.move_down" => {
+          if let SettingValue::Key(v) = &setting.value {
+            if let Ok(key) = crate::core::user_config::parse_key_public(v.clone()) {
+              self.user_config.keys.move_down = key;
+            }
+          }
+        }
+        "keys.move_left" => {
+          if let SettingValue::Key(v) = &setting.value {
+            if let Ok(key) = crate::core::user_config::parse_key_public(v.clone()) {
+              self.user_config.keys.move_left = key;
+            }
+          }
+        }
+        "keys.move_right" => {
+          if let SettingValue::Key(v) = &setting.value {
+            if let Ok(key) = crate::core::user_config::parse_key_public(v.clone()) {
+              self.user_config.keys.move_right = key;
             }
           }
         }
