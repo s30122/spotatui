@@ -161,6 +161,11 @@ pub struct EpisodeInfo {
   pub uri: Option<String>,
   pub name: String,
   pub duration_ms: u64,
+  /// Parent show name. Populated from a full episode (e.g. a queue item);
+  /// empty for simplified episodes that are already shown within their show's
+  /// context (the show-episodes list).
+  #[serde(default)]
+  pub show_name: String,
   #[serde(default)]
   pub description: String,
   #[serde(default)]

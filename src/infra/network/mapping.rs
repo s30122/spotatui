@@ -215,6 +215,9 @@ impl From<&SimplifiedEpisode> for EpisodeInfo {
       id: Some(e.id.id().to_string()),
       uri: Some(e.id.uri()),
       name: e.name.clone(),
+      // SimplifiedEpisode carries no parent show; it is only ever listed within
+      // a show's own episode view, where the show name is shown separately.
+      show_name: String::new(),
       duration_ms: duration_ms(e.duration),
       description: e.description.clone(),
       release_date: e.release_date.clone(),
@@ -230,6 +233,7 @@ impl From<&FullEpisode> for EpisodeInfo {
       id: Some(e.id.id().to_string()),
       uri: Some(e.id.uri()),
       name: e.name.clone(),
+      show_name: e.show.name.clone(),
       duration_ms: duration_ms(e.duration),
       description: e.description.clone(),
       release_date: e.release_date.clone(),
