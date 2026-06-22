@@ -15,3 +15,5 @@ pub mod player;
 pub mod redirect_uri;
 #[cfg(feature = "scripting")]
 pub mod scripting;
+#[cfg(feature = "subsonic")]
+pub mod subsonic;

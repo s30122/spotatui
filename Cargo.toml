@@ -53,6 +53,7 @@ discord-rich-presence = { version = "1.1", optional = true }
 ratatui-image = { version = "11.0.4", optional = true, default-features = false, features = ["crossterm"] }
 image = { version = "0.25", optional = true }
 mlua = { version = "0.11", features = ["lua54", "vendored", "serde"], optional = true }
+md-5 = { version = "0.10", optional = true }
 
 # Local-files media source dependencies
 symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav", "aiff", "isomp4", "mkv", "pcm", "vorbis"], optional = true, default-features = false }
@@ -127,6 +128,7 @@ discord-rpc = ["discord-rich-presence"]
 cover-art = ["ratatui-image", "image"]
 scripting = ["dep:mlua"]
 local-files = ["dep:symphonia", "dep:lofty"]
+subsonic = ["dep:md-5"]
 
 [dev-dependencies]
 tempfile = "3"
