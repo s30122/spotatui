@@ -1,3 +1,4 @@
+use crate::core::plugin_api::TrackInfo;
 use crate::core::sort::{SortContext, SortField, SortOrder, SortState};
 use crate::core::user_config::{color_to_string, normalize_tick_rate_milliseconds, UserConfig};
 use crate::infra::network::sync::{PartySession, PartyStatus};
@@ -991,8 +992,8 @@ pub struct App {
   pub create_playlist_name_idx: usize,
   pub create_playlist_name_cursor: u16,
   pub create_playlist_stage: CreatePlaylistStage,
-  pub create_playlist_tracks: Vec<FullTrack>,
-  pub create_playlist_search_results: Vec<FullTrack>,
+  pub create_playlist_tracks: Vec<TrackInfo>,
+  pub create_playlist_search_results: Vec<TrackInfo>,
   pub create_playlist_search_input: Vec<char>,
   pub create_playlist_search_idx: usize,
   pub create_playlist_search_cursor: u16,

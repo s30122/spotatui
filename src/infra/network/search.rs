@@ -1,4 +1,5 @@
 use super::{IoEvent, Network};
+use crate::core::plugin_api::TrackInfo;
 use anyhow::anyhow;
 use rspotify::model::{
   artist::FullArtist, enums::Country, idtypes::AlbumId, page::Page, playlist::SimplifiedPlaylist,
@@ -165,8 +166,9 @@ impl SearchNetwork for Network {
       Ok(res) => res
         .tracks
         .items
-        .into_iter()
-        .filter_map(|t| if t.id.is_some() { Some(t) } else { None })
+        .iter()
+        .filter(|t| t.id.is_some())
+        .map(TrackInfo::from)
         .collect::<Vec<_>>(),
       Err(e) => {
         self.handle_error(anyhow!(e)).await;
