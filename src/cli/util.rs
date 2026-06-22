@@ -156,6 +156,10 @@ pub enum FormatType {
   Artist(Box<FullArtist>),
   Playlist(Box<SimplifiedPlaylist>),
   Track(Box<FullTrack>),
+  /// Domain track (used by sources already migrated off rspotify, e.g. the
+  /// track table). The rspotify `Track` variant remains for not-yet-migrated
+  /// CLI paths (current-playback item, search results).
+  TrackInfo(Box<crate::core::plugin_api::TrackInfo>),
   Episode(Box<FullEpisode>),
   Show(Box<SimplifiedShow>),
 }
@@ -214,6 +218,15 @@ impl Format {
           Self::Artist(joined_artists),
           Self::Track(t.name),
           Self::Uri(uri),
+        ]
+      }
+      FormatType::TrackInfo(t) => {
+        // Domain track: artists is already a Vec<String>, album/uri are plain.
+        vec![
+          Self::Album(t.album),
+          Self::Artist(t.artists.join(", ")),
+          Self::Track(t.name),
+          Self::Uri(t.uri.unwrap_or_default()),
         ]
       }
       FormatType::Show(r) => {

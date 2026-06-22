@@ -252,7 +252,7 @@ impl CliApp {
           .map(|t| {
             self.format_output(
               format.to_string(),
-              Format::from_type(FormatType::Track(Box::new(t.clone()))),
+              Format::from_type(FormatType::TrackInfo(Box::new(t.clone()))),
             )
           })
           .collect::<Vec<String>>();

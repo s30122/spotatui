@@ -169,9 +169,9 @@ fn handle_recommend_event_on_selected_block(app: &mut App) {
           let track_id_list: Option<Vec<String>> = track.id.as_ref().map(|id| vec![id.clone()]);
           app.recommendations_context = Some(RecommendationsContext::Song);
           app.recommendations_seed = track.name.clone();
-          // We cannot pass a FullTrack here (track_table is owned by another slice).
-          // Pass None so recommendations still work without a prepended seed track.
-          app.get_recommendations_for_seed(None, track_id_list, None);
+          // `track` is already a domain TrackInfo (Artist.top_tracks was
+          // migrated), so seed recommendations with it directly.
+          app.get_recommendations_for_seed(None, track_id_list, Some(track.clone()));
         }
       }
       ArtistBlock::RelatedArtists => {
