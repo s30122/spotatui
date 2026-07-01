@@ -54,6 +54,9 @@ ratatui-image = { version = "11.0.4", optional = true, default-features = false,
 image = { version = "0.25", optional = true }
 mlua = { version = "0.11", features = ["lua54", "vendored", "serde"], optional = true }
 md-5 = { version = "0.10", optional = true }
+# Subsonic streams each track to a tempfile before playing it through the shared
+# rodio sink. Also a dev-dependency (used by tests across features).
+tempfile = { version = "3", optional = true }
 
 # Local-files media source dependencies
 symphonia = { version = "0.5", features = ["mp3", "flac", "ogg", "wav", "aiff", "isomp4", "mkv", "pcm", "vorbis"], optional = true, default-features = false }
@@ -133,8 +136,11 @@ windows-media = ["smtc-tokio", "streaming"] # windows SMTC integration
 discord-rpc = ["discord-rich-presence"]
 cover-art = ["ratatui-image", "image"]
 scripting = ["dep:mlua"]
-local-files = ["dep:symphonia", "dep:lofty", "dep:rodio"]
-subsonic = ["dep:md-5"]
+# Shared audio decode/output engine (rodio bundles symphonia). Pulled by any
+# source that plays decoded audio through the local sink (local files, Subsonic).
+audio-decode = ["dep:rodio"]
+local-files = ["audio-decode", "dep:lofty", "dep:symphonia"]
+subsonic = ["dep:md-5", "audio-decode", "dep:tempfile"]
 
 [dev-dependencies]
 tempfile = "3"

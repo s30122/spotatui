@@ -750,20 +750,22 @@ fn draw_lyrics(f: &mut Frame<'_>, app: &App, area: Rect) {
   }
 }
 
-/// Display snapshot for the local-file playbar.
+/// Display snapshot for an engine playbar (local files or Subsonic).
 ///
 /// Extracted from the live player so [`render_local_playbar`] is a pure function
 /// of plain values and can be unit-tested with `TestBackend` (no audio device).
-#[cfg(feature = "local-files")]
+#[cfg(any(feature = "local-files", feature = "subsonic"))]
 struct LocalPlaybarView {
+  /// Source name shown in the playbar title, e.g. `"Local"` or `"Subsonic"`.
+  source_label: &'static str,
   name: String,
   artists: String,
   is_playing: bool,
   position_ms: u128,
   duration_ms: u64,
   volume_percent: u8,
-  /// 1-based position in the local queue and total length, e.g. `(3, 12)` =>
-  /// "3/12". `None` hides the indicator (e.g. a one-track session).
+  /// 1-based position in the queue and total length, e.g. `(3, 12)` => "3/12".
+  /// `None` hides the indicator (e.g. a one-track session).
   queue_position: Option<(usize, usize)>,
 }
 
@@ -778,6 +780,7 @@ fn draw_local_playbar(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
     return;
   };
   let view = LocalPlaybarView {
+    source_label: "Local",
     name: local.name.clone(),
     artists: local.artists.clone(),
     is_playing: !local.player.is_paused(),
@@ -790,7 +793,29 @@ fn draw_local_playbar(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
   render_local_playbar(f, app, layout_chunk, &view);
 }
 
-#[cfg(feature = "local-files")]
+/// Render the playbar for an active Subsonic playback session, reading
+/// progress/pause live from the player just like the local path.
+#[cfg(feature = "subsonic")]
+fn draw_subsonic_playbar(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
+  let Some(subsonic) = app.subsonic_playback.as_ref() else {
+    return;
+  };
+  let track = subsonic.current();
+  let view = LocalPlaybarView {
+    source_label: "Subsonic",
+    name: track.map(|t| t.name.clone()).unwrap_or_default(),
+    artists: track.map(|t| t.artists.join(", ")).unwrap_or_default(),
+    is_playing: !subsonic.player.is_paused(),
+    position_ms: subsonic.player.position().as_millis(),
+    duration_ms: track.map(|t| t.duration_ms).unwrap_or(0),
+    volume_percent: app.user_config.behavior.volume_percent,
+    queue_position: (subsonic.tracks.len() > 1)
+      .then(|| (subsonic.index + 1, subsonic.tracks.len())),
+  };
+  render_local_playbar(f, app, layout_chunk, &view);
+}
+
+#[cfg(any(feature = "local-files", feature = "subsonic"))]
 fn render_local_playbar(f: &mut Frame<'_>, app: &App, layout_chunk: Rect, view: &LocalPlaybarView) {
   let playbar_areas = playbar_layout_areas(app, layout_chunk);
 
@@ -813,8 +838,8 @@ fn render_local_playbar(f: &mut Frame<'_>, app: &App, layout_chunk: Rect, view: 
     None => String::new(),
   };
   let title = format!(
-    "{:-7} (Local{} | Volume: {:-2}%)",
-    play_title, queue_label, view.volume_percent
+    "{:-7} ({}{} | Volume: {:-2}%)",
+    play_title, view.source_label, queue_label, view.volume_percent
   );
   let mut title_spans = vec![Span::styled(
     title,
@@ -890,6 +915,13 @@ pub fn draw_playbar(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
   #[cfg(feature = "local-files")]
   if app.local_playback.is_some() {
     draw_local_playbar(f, app, layout_chunk);
+    return;
+  }
+
+  // Subsonic playback likewise renders from its own session state.
+  #[cfg(feature = "subsonic")]
+  if app.subsonic_playback.is_some() {
+    draw_subsonic_playbar(f, app, layout_chunk);
     return;
   }
 
@@ -1292,19 +1324,21 @@ pub fn draw_device_list(f: &mut Frame<'_>, app: &App) {
   f.render_stateful_widget(source_list, source_area, &mut source_state);
 
   // --- Devices panel (Spotify Connect only) ---
-  let local_active = app.active_source == Source::Local;
-  let devices_focused = app.source_device_focus == SourceFocus::Devices && !local_active;
+  // Dimmed under any non-Spotify source (Local, Subsonic): device transfer is a
+  // Spotify Connect feature.
+  let non_spotify_active = app.active_source != Source::Spotify;
+  let devices_focused = app.source_device_focus == SourceFocus::Devices && !non_spotify_active;
   let devices_color = if devices_focused {
     app.user_config.theme.active
   } else {
     app.user_config.theme.inactive
   };
-  let devices_title = if local_active {
+  let devices_title = if non_spotify_active {
     "Devices (Spotify only)"
   } else {
     "Devices"
   };
-  let device_text_style = if local_active {
+  let device_text_style = if non_spotify_active {
     Style::default().fg(app.user_config.theme.inactive)
   } else {
     app.user_config.theme.base_style()
@@ -1561,6 +1595,7 @@ mod tests {
   #[test]
   fn local_playbar_renders_name_state_and_progress() {
     let view = LocalPlaybarView {
+      source_label: "Local",
       name: "My Local Song".to_string(),
       artists: "Some Artist".to_string(),
       is_playing: true,
@@ -1597,6 +1632,7 @@ mod tests {
   #[test]
   fn local_playbar_shows_paused_state() {
     let view = LocalPlaybarView {
+      source_label: "Local",
       name: "Track".to_string(),
       artists: "Artist".to_string(),
       is_playing: false,

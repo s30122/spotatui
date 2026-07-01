@@ -33,12 +33,12 @@ use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use super::player::LocalPlayer;
 use super::{
   file_uri_to_path, next_index, prev_index, track_info_from_path, LocalPlaybackState, LocalSource,
 };
 use crate::core::app::{App, TrackTableContext};
 use crate::core::source::MediaSource;
+use crate::infra::audio::LocalPlayer;
 use crate::infra::network::IoEvent;
 
 /// Whether a URI is owned by the local-files source.
@@ -206,6 +206,17 @@ async fn start_local_queue(app: &Arc<Mutex<App>>, queue: Vec<String>, start_idx:
     let streaming = app.lock().await.streaming_player.clone();
     if let Some(player) = streaming {
       player.pause();
+    }
+  }
+
+  // Tear down any Subsonic session (the `!handled_locally` short-circuit in the
+  // runtime means the subsonic dispatch never sees this file:// start, so the
+  // teardown must happen here — see infra::subsonic::dispatch device ownership).
+  #[cfg(feature = "subsonic")]
+  {
+    let subsonic = app.lock().await.subsonic_playback.take();
+    if let Some(subsonic) = subsonic {
+      subsonic.player.stop();
     }
   }
 

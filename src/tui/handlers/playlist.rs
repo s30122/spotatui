@@ -10,10 +10,10 @@ use rspotify::model::idtypes::PlaylistId;
 /// playlists/folders + the "Add Playlist" entry; for Local it is the folder
 /// count (no write capability, so no "Add Playlist").
 fn total_display_count(app: &App) -> usize {
-  if app.active_source == Source::Local {
-    app.local_playlists.len()
-  } else {
-    app.get_playlist_display_count() + 1
+  match app.active_source {
+    Source::Local => app.local_playlists.len(),
+    Source::Subsonic => app.subsonic_playlists.len(),
+    Source::Spotify => app.get_playlist_display_count() + 1,
   }
 }
 
@@ -28,6 +28,22 @@ fn open_local_folder(app: &mut App) {
     app.track_table.selected_index = 0;
     app.track_table.context = Some(TrackTableContext::LocalPlaylist);
     app.dispatch(IoEvent::GetLocalTracks(uri));
+    app.push_navigation_stack(RouteId::TrackTable, ActiveBlock::TrackTable);
+  }
+}
+
+/// Subsonic: open the highlighted server playlist's tracks in the shared track
+/// table.
+fn open_subsonic_folder(app: &mut App) {
+  let Some(idx) = app.selected_playlist_index else {
+    return;
+  };
+  if let Some(playlist) = app.subsonic_playlists.get(idx) {
+    let uri = playlist.uri.clone();
+    app.track_table.tracks = Vec::new();
+    app.track_table.selected_index = 0;
+    app.track_table.context = Some(TrackTableContext::SubsonicPlaylist);
+    app.dispatch(IoEvent::GetSubsonicTracks(uri));
     app.push_navigation_stack(RouteId::TrackTable, ActiveBlock::TrackTable);
   }
 }
@@ -73,6 +89,9 @@ pub fn handler(key: Key, app: &mut App) {
     }
     Key::Enter if app.active_source == Source::Local => {
       open_local_folder(app);
+    }
+    Key::Enter if app.active_source == Source::Subsonic => {
+      open_subsonic_folder(app);
     }
     Key::Enter => {
       if let Some(selected_idx) = app.selected_playlist_index {

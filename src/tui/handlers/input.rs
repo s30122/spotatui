@@ -113,8 +113,13 @@ fn process_input(app: &mut App, input: String) {
     return;
   }
 
-  // Default fallback behavior: treat the input as a raw search phrase.
-  app.dispatch(IoEvent::GetSearchResults(input, app.get_user_country()));
+  // Default fallback behavior: treat the input as a raw search phrase, routed to
+  // the active source's catalog.
+  if app.active_source == crate::core::source::Source::Subsonic {
+    app.dispatch(IoEvent::GetSubsonicSearchResults(input));
+  } else {
+    app.dispatch(IoEvent::GetSearchResults(input, app.get_user_country()));
+  }
   app.push_navigation_stack(RouteId::Search, ActiveBlock::SearchResultBlock);
   // push_navigation_stack is a no-op when the Search route is already on top, which
   // otherwise leaves focus trapped in the input box. Force focus onto the results so

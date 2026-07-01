@@ -774,6 +774,32 @@ pub async fn start_ui(
           }
         }
 
+        // Subsonic auto-advance — same check-and-set as local. `advancing` is set
+        // *synchronously here* (before dispatching NextTrack) because the sink is
+        // empty for the whole multi-second download window; without it the next
+        // tick would re-dispatch and skip several tracks per advance.
+        #[cfg(feature = "subsonic")]
+        {
+          let advance = app.subsonic_playback.as_mut().and_then(|subsonic| {
+            if subsonic.player.is_finished() && !subsonic.advancing {
+              if crate::infra::subsonic::next_index(subsonic.index, subsonic.tracks.len()).is_some()
+              {
+                subsonic.advancing = true; // atomic check-and-set: one dispatch only
+                Some(true)
+              } else {
+                Some(false)
+              }
+            } else {
+              None
+            }
+          });
+          match advance {
+            Some(true) => app.dispatch(crate::infra::network::IoEvent::NextTrack),
+            Some(false) => app.subsonic_playback = None,
+            None => {}
+          }
+        }
+
         #[cfg(feature = "streaming")]
         if let Some(ref pos) = shared_position {
           if app.is_streaming_active {

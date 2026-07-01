@@ -403,6 +403,7 @@ pub enum TrackTableContext {
   RecommendedTracks,
   DiscoverPlaylist,
   LocalPlaylist,
+  SubsonicPlaylist,
 }
 
 // Is it possible to compose enums?
@@ -872,6 +873,10 @@ pub struct App {
   /// Local Files browser, and the cursor within that list.
   pub local_playlists: Vec<PlaylistInfo>,
   pub local_playlists_index: usize,
+  /// The user's Subsonic server playlists shown by the Subsonic browser, and the
+  /// cursor within that list. Populated by `GetSubsonicPlaylists` dispatch.
+  pub subsonic_playlists: Vec<PlaylistInfo>,
+  pub subsonic_playlists_index: usize,
   /// The source the UI is currently scoped to (sidebar, search, capability
   /// gating). Browse-scope only — never changes playback routing.
   pub active_source: Source,
@@ -1020,6 +1025,12 @@ pub struct App {
   /// file is playing; dropping it releases the audio output device.
   #[cfg(feature = "local-files")]
   pub local_playback: Option<crate::infra::local::LocalPlaybackState>,
+  /// The active Subsonic playback session (multi-source Phase 4), or `None` when
+  /// another backend owns playback. Same decoupling contract as
+  /// [`local_playback`](Self::local_playback): the playbar reads progress/pause
+  /// live from the player here, never touching Spotify/librespot fields.
+  #[cfg(feature = "subsonic")]
+  pub subsonic_playback: Option<crate::infra::subsonic::SubsonicPlaybackState>,
   /// Sender used to recover native streaming when a stale/disconnected player is detected.
   #[cfg(feature = "streaming")]
   pub streaming_recovery_tx:
@@ -1098,6 +1109,8 @@ impl Default for App {
       artists_list_index: 0,
       local_playlists: Vec::new(),
       local_playlists_index: 0,
+      subsonic_playlists: Vec::new(),
+      subsonic_playlists_index: 0,
       active_source: Source::default(),
       source_list_index: 0,
       source_device_focus: SourceFocus::default(),
@@ -1257,6 +1270,8 @@ impl Default for App {
       streaming_player: None,
       #[cfg(feature = "local-files")]
       local_playback: None,
+      #[cfg(feature = "subsonic")]
+      subsonic_playback: None,
       #[cfg(feature = "streaming")]
       streaming_recovery_tx: None,
       #[cfg(all(feature = "mpris", target_os = "linux"))]
@@ -2351,6 +2366,17 @@ impl App {
         local.player.resume();
       } else {
         local.player.pause();
+      }
+      return;
+    }
+
+    // Subsonic playback owns the session the same way: toggle its sink directly.
+    #[cfg(feature = "subsonic")]
+    if let Some(subsonic) = &self.subsonic_playback {
+      if subsonic.player.is_paused() {
+        subsonic.player.resume();
+      } else {
+        subsonic.player.pause();
       }
       return;
     }

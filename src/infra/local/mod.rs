@@ -9,12 +9,11 @@
 #![allow(dead_code)]
 
 pub mod dispatch;
-pub mod player;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use self::player::LocalPlayer;
+use crate::infra::audio::LocalPlayer;
 
 /// The active local-file playback session.
 ///

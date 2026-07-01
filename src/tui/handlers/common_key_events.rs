@@ -112,10 +112,11 @@ pub fn handle_right_event(app: &mut App) {
   };
 }
 
-/// The topmost focusable sidebar block for the active source. Under Local the
-/// Library list is hidden, so the (local-folder) Playlists block sits on top.
+/// The topmost focusable sidebar block for the active source. Under any
+/// non-Spotify source (Local, Subsonic) the Library list is hidden, so the
+/// Playlists block sits on top.
 pub fn sidebar_top_block(app: &App) -> ActiveBlock {
-  if app.active_source == Source::Local {
+  if app.active_source != Source::Spotify {
     ActiveBlock::MyPlaylists
   } else {
     ActiveBlock::Library

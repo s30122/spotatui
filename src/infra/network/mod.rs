@@ -163,6 +163,18 @@ pub enum IoEvent {
   /// feature); without it the event is an inert no-op.
   #[cfg_attr(not(feature = "local-files"), allow(dead_code))]
   GetLocalTracks(String),
+  /// List the user's Subsonic server playlists (handled by
+  /// `infra::subsonic::dispatch`; a no-op on the Spotify network).
+  GetSubsonicPlaylists,
+  /// List the tracks of a Subsonic playlist, identified by its
+  /// `subsonic:playlist:` URI. Only read by `infra::subsonic::dispatch` (the
+  /// `subsonic` feature); without it the event is an inert no-op.
+  #[cfg_attr(not(feature = "subsonic"), allow(dead_code))]
+  GetSubsonicTracks(String),
+  /// Run a Subsonic catalog search and populate `app.search_results`. Only read
+  /// by `infra::subsonic::dispatch`; an inert no-op without the `subsonic` feature.
+  #[cfg_attr(not(feature = "subsonic"), allow(dead_code))]
+  GetSubsonicSearchResults(String),
 }
 
 pub struct Network {
@@ -519,6 +531,11 @@ impl Network {
       // Local-files browse events are handled by infra::local::dispatch before
       // reaching the network; they only arrive here when the feature is off.
       IoEvent::GetLocalPlaylists | IoEvent::GetLocalTracks(_) => {}
+      // Subsonic browse/search events are handled by infra::subsonic::dispatch
+      // before reaching the network; they only arrive here when the feature is off.
+      IoEvent::GetSubsonicPlaylists
+      | IoEvent::GetSubsonicTracks(_)
+      | IoEvent::GetSubsonicSearchResults(_) => {}
     };
 
     {

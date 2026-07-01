@@ -1376,7 +1376,16 @@ async fn start_tokio(io_rx: std::sync::mpsc::Receiver<IoEvent>, network: &mut Ne
             false
           }
         };
-        if !handled_locally {
+        // Subsonic is intercepted after local and before the Spotify network. A
+        // `subsonic:` URI falls through the local dispatch (its `is_file_uri` is
+        // false) and is caught here (see infra::subsonic::dispatch). Skipped when
+        // local already consumed the event.
+        #[cfg(feature = "subsonic")]
+        let handled_subsonic = !handled_locally
+          && crate::infra::subsonic::dispatch::route_subsonic_event(&network.app, &io_event).await;
+        #[cfg(not(feature = "subsonic"))]
+        let handled_subsonic = false;
+        if !handled_locally && !handled_subsonic {
           network.handle_network_event(io_event).await;
         }
       }

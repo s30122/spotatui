@@ -31,26 +31,28 @@ use anyhow::Result;
 /// (that stays URI-scheme driven via `route_local_event` + `App::local_playback`),
 /// so switching the active source never interrupts what is currently playing.
 ///
-/// The enum is deliberately unconditional — both variants compile in every
+/// The enum is deliberately unconditional — every variant compiles in every
 /// build (including the slim `telemetry`-only CI build) so handlers and UI code
-/// never need `#[cfg]`. Only the Local *data loading* is gated behind the
-/// `local-files` feature.
+/// never need `#[cfg]`. Only the per-source *data loading* is gated behind that
+/// source's feature (`local-files`, `subsonic`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Source {
   #[default]
   Spotify,
   Local,
+  Subsonic,
 }
 
 impl Source {
   /// Every selectable source, in display order. Add new sources here.
-  pub const ALL: [Source; 2] = [Source::Spotify, Source::Local];
+  pub const ALL: [Source; 3] = [Source::Spotify, Source::Local, Source::Subsonic];
 
   /// Human-readable label shown in the source picker.
   pub fn label(&self) -> &'static str {
     match self {
       Source::Spotify => "Spotify",
       Source::Local => "Local Files",
+      Source::Subsonic => "Subsonic",
     }
   }
 
@@ -61,6 +63,7 @@ impl Source {
     match self {
       Source::Spotify => "Spotify",
       Source::Local => "Local",
+      Source::Subsonic => "Subsonic",
     }
   }
 
@@ -70,13 +73,14 @@ impl Source {
   pub fn from_config_str(s: &str) -> Self {
     match s {
       "Local" => Source::Local,
+      "Subsonic" => Source::Subsonic,
       _ => Source::Spotify,
     }
   }
 
   /// Whether this source can search its catalog (implements [`Searcher`]).
   pub fn supports_search(&self) -> bool {
-    matches!(self, Source::Spotify)
+    matches!(self, Source::Spotify | Source::Subsonic)
   }
 
   /// Whether this source exposes a saved library — liked songs, saved albums,
@@ -116,6 +120,24 @@ mod tests {
     assert!(!Source::Local.supports_library());
     assert!(!Source::Local.supports_playlist_write());
     assert!(!Source::Local.supports_like());
+  }
+
+  #[test]
+  fn subsonic_supports_search_only() {
+    // Subsonic speaks `search3`, so search is on; library/playlist-write/like
+    // depend on `LibraryProvider`/`PlaylistWriter` impls that are deferred
+    // follow-ups, so they stay off for now.
+    assert!(Source::Subsonic.supports_search());
+    assert!(!Source::Subsonic.supports_library());
+    assert!(!Source::Subsonic.supports_playlist_write());
+    assert!(!Source::Subsonic.supports_like());
+  }
+
+  #[test]
+  fn config_str_round_trips_every_source() {
+    for source in Source::ALL {
+      assert_eq!(Source::from_config_str(source.to_config_str()), source);
+    }
   }
 }
 

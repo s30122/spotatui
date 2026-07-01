@@ -61,6 +61,30 @@ pub fn draw_playlist_block(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
     return;
   }
 
+  // Subsonic: the sidebar Playlists panel lists the server's playlists (no
+  // local-write support, so no "Add Playlist").
+  if app.active_source == Source::Subsonic {
+    let items: Vec<String> = if app.subsonic_playlists.is_empty() {
+      vec!["(no playlists \u{2014} configure server, then press `d`)".to_string()]
+    } else {
+      app
+        .subsonic_playlists
+        .iter()
+        .map(|p| format!("\u{1F3B5} {}", p.name))
+        .collect()
+    };
+    draw_selectable_list(
+      f,
+      app,
+      layout_chunk,
+      "Subsonic",
+      &items,
+      highlight_state,
+      app.selected_playlist_index,
+    );
+    return;
+  }
+
   let display_items = app.get_playlist_display_items();
 
   let playlist_items: Vec<String> = if app.playlist_folder_items.is_empty() {
@@ -109,6 +133,22 @@ pub fn draw_user_block(f: &mut Frame<'_>, app: &App, layout_chunk: Rect) {
   // fills the whole sidebar — no input box, no Library panel.
   if app.active_source == Source::Local {
     draw_playlist_block(f, app, layout_chunk);
+    return;
+  }
+
+  // Subsonic supports search but has no Spotify-style saved library, so keep the
+  // search input and show the server playlists, but hide the Library panel.
+  if app.active_source == Source::Subsonic {
+    if app.size.width >= SMALL_TERMINAL_WIDTH && !app.user_config.behavior.enforce_wide_search_bar {
+      let [input_area, playlist_area] = layout_chunk.layout(&Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+      ]));
+      draw_input_and_help_box(f, app, input_area);
+      draw_playlist_block(f, app, playlist_area);
+    } else {
+      draw_playlist_block(f, app, layout_chunk);
+    }
     return;
   }
 

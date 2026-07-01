@@ -22,7 +22,10 @@
 // Nothing in the binary wires this source yet.
 #![allow(dead_code)]
 
+pub mod dispatch;
 mod types;
+
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use md5::{Digest, Md5};
@@ -33,6 +36,7 @@ use crate::core::plugin_api::{
   AlbumInfo, ArtistInfo, ArtistRef, PlaylistInfo, SearchResults, TrackInfo,
 };
 use crate::core::source::{MediaSource, Searcher};
+use crate::infra::audio::LocalPlayer;
 
 use types::{SubsonicEnvelope, SubsonicResponse};
 
@@ -45,6 +49,70 @@ const CLIENT_NAME: &str = "spotatui";
 
 const PLAYLIST_PREFIX: &str = "subsonic:playlist:";
 const TRACK_PREFIX: &str = "subsonic:track:";
+
+// ---------------------------------------------------------------------------
+// SubsonicPlaybackState
+// ---------------------------------------------------------------------------
+
+/// The active Subsonic playback session.
+///
+/// Like the local-files [`LocalPlaybackState`](crate::infra::local::LocalPlaybackState)
+/// it owns the live [`LocalPlayer`], a queue of `subsonic:track:` URIs plus the
+/// current index, and the static metadata of the playing track. Dynamic state
+/// (position, paused) is read **live** from `player`, so it is never mirrored
+/// into Spotify/librespot fields and cannot desync.
+///
+/// Two fields are specific to a *remote* source: it holds the
+/// [`SubsonicSource`] (to authenticate and download each track on Next/advance)
+/// and the downloaded [`tempfile::NamedTempFile`] for the current track. The
+/// tempfile is kept alive here because `rodio` reads it incrementally during
+/// playback; it is dropped (and cleaned up) when replaced or on teardown.
+pub struct SubsonicPlaybackState {
+  pub player: Arc<LocalPlayer>,
+  /// Source handle, reused to build authed stream URLs and download per track.
+  pub source: Arc<SubsonicSource>,
+  /// The playing playlist's tracks (with API metadata) in order. The URI for
+  /// track `i` is `tracks[i].uri`; the playbar reads name/artists/album/duration
+  /// from `tracks[index]`. Stored in full (vs local's URI-only queue) because the
+  /// metadata came from the API, not from on-disk tags re-read per track.
+  pub tracks: Vec<TrackInfo>,
+  /// Index into [`tracks`](Self::tracks) of the currently playing track.
+  pub index: usize,
+  /// Auto-advance guard, identical in purpose to the local one: set while a
+  /// track change is downloading/decoding so the runner tick does not mistake
+  /// the empty sink for end-of-track and fire repeated `NextTrack` dispatches.
+  /// The download window is much longer than local's decode, so this guard is
+  /// load-bearing for remote playback.
+  pub advancing: bool,
+  /// The downloaded audio for the current track, kept alive while it plays.
+  pub tempfile: tempfile::NamedTempFile,
+}
+
+impl SubsonicPlaybackState {
+  /// The currently playing track, if `index` is in range.
+  pub fn current(&self) -> Option<&TrackInfo> {
+    self.tracks.get(self.index)
+  }
+}
+
+/// The index of the track after `current` in a queue of `len`, or `None` at the
+/// end. Copied from `infra::local` (which is not compiled without `local-files`).
+pub fn next_index(current: usize, len: usize) -> Option<usize> {
+  if len == 0 || current + 1 >= len {
+    None
+  } else {
+    Some(current + 1)
+  }
+}
+
+/// The index of the track before `current`, or `None` at the start.
+pub fn prev_index(current: usize, len: usize) -> Option<usize> {
+  if len == 0 || current == 0 {
+    None
+  } else {
+    Some(current - 1)
+  }
+}
 
 // ---------------------------------------------------------------------------
 // SubsonicSource
@@ -167,6 +235,47 @@ impl SubsonicSource {
     self.fetch(&url).await?;
     Ok(())
   }
+
+  /// The authenticated `stream.view` URL for a track id. The server transcodes
+  /// to a playable container (MP3 by default); the response carries an audio
+  /// content-type and supports HTTP range requests.
+  pub fn stream_url(&self, track_id: &str) -> String {
+    Self::append_param(
+      &self.endpoint_url("stream.view"),
+      "id",
+      &url_encode(track_id),
+    )
+  }
+
+  /// Download a track's audio to `dest`. Buffers the whole response in memory
+  /// then writes it; the file is then played from disk by the shared player.
+  ///
+  /// Async (reqwest), so it must be awaited **without** holding `App`'s lock.
+  pub async fn download_track(&self, track_id: &str, dest: &std::path::Path) -> Result<()> {
+    let url = self.stream_url(track_id);
+    let bytes = self
+      .http
+      .get(&url)
+      .send()
+      .await
+      .context("HTTP request to Subsonic stream failed")?
+      .error_for_status()
+      .context("Subsonic stream returned an HTTP error")?
+      .bytes()
+      .await
+      .context("Failed to read Subsonic stream body")?;
+    tokio::fs::write(dest, &bytes)
+      .await
+      .with_context(|| format!("writing stream to {}", dest.display()))?;
+    Ok(())
+  }
+}
+
+/// Strip the `subsonic:track:` prefix and return the raw track id.
+pub fn track_id_from_uri(uri: &str) -> Result<&str> {
+  uri
+    .strip_prefix(TRACK_PREFIX)
+    .ok_or_else(|| anyhow!("Not a subsonic track URI: {}", uri))
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +297,7 @@ impl From<&types::SubsonicPlaylist> for PlaylistInfo {
       owner: p.owner.clone(),
       track_count: p.song_count,
       id: Some(p.id.clone()),
+      owner_id: None, // Subsonic has no separate base62 user id; `owner` is the username
       collaborative: false,
       public: p.public,
       image_url: None, // Subsonic uses cover_art IDs, not direct URLs
@@ -203,6 +313,7 @@ impl From<&types::PlaylistDetail> for PlaylistInfo {
       owner: p.owner.clone(),
       track_count: p.song_count,
       id: Some(p.id.clone()),
+      owner_id: None,
       collaborative: false,
       public: p.public,
       image_url: None,
@@ -364,6 +475,115 @@ fn url_encode(s: &str) -> String {
 mod tests {
   use super::*;
   use crate::infra::subsonic::types::SubsonicEnvelope;
+
+  /// Live end-to-end smoke test against the public Navidrome demo server.
+  /// Ignored by default (hits the network); run with:
+  /// `cargo test --features subsonic -- --ignored live_demo`
+  #[tokio::test]
+  #[ignore = "hits the live Navidrome demo server"]
+  async fn live_demo_browse_and_search() {
+    let source = SubsonicSource::new("https://demo.navidrome.org", "demo", "demo");
+    source.ping().await.expect("ping should succeed");
+
+    let playlists = source.playlists().await.expect("playlists should load");
+    assert!(!playlists.is_empty(), "demo server should have playlists");
+
+    let tracks = source
+      .tracks(&playlists[0].uri)
+      .await
+      .expect("playlist tracks should load");
+    assert!(!tracks.is_empty(), "first playlist should have tracks");
+    // Every track must carry a `subsonic:track:` URI so playback can route it.
+    assert!(tracks.iter().all(|t| t
+      .uri
+      .as_deref()
+      .is_some_and(|u| u.starts_with(TRACK_PREFIX))));
+
+    let results = source.search("love").await.expect("search should succeed");
+    assert!(
+      !results.tracks.is_empty(),
+      "search for 'love' should return tracks"
+    );
+  }
+
+  /// Live download smoke test: stream a real demo track to a tempfile and check
+  /// it is non-empty with a plausible audio header. Catches auth/URL-encoding
+  /// bugs in `stream_url`/`download_track` that the JSON tests can't. Ignored by
+  /// default (network); run with:
+  /// `cargo test --features subsonic -- --ignored live_demo_download`
+  #[tokio::test]
+  #[ignore = "hits the live Navidrome demo server"]
+  async fn live_demo_download_streams_audio() {
+    let source = SubsonicSource::new("https://demo.navidrome.org", "demo", "demo");
+    let playlists = source.playlists().await.expect("playlists should load");
+    let tracks = source
+      .tracks(&playlists[0].uri)
+      .await
+      .expect("tracks should load");
+    let uri = tracks[0].uri.as_deref().expect("track should have a uri");
+    let track_id = track_id_from_uri(uri).expect("uri should be a subsonic track uri");
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    source
+      .download_track(track_id, tmp.path())
+      .await
+      .expect("download should succeed");
+
+    let bytes = std::fs::read(tmp.path()).unwrap();
+    assert!(bytes.len() > 4096, "downloaded audio should be non-trivial");
+    // Navidrome transcodes the demo library to MP3 by default: either an ID3 tag
+    // ("ID3") or a raw MPEG frame sync (0xFF, 0xEx/0xFx).
+    let is_mp3 = bytes.starts_with(b"ID3") || (bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0);
+    assert!(
+      is_mp3,
+      "expected an MP3 header, got bytes {:02X?}",
+      &bytes[..4]
+    );
+  }
+
+  /// Full streaming-playback path: download a real demo track and play it through
+  /// the shared [`LocalPlayer`], asserting the sink actually advances. Verifies
+  /// download -> decode -> audio sink together. Ignored (needs network **and** an
+  /// audio output device); run with:
+  /// `cargo test --features subsonic -- --ignored live_demo_stream_plays`
+  #[tokio::test]
+  #[ignore = "hits the live demo server AND requires an audio output device"]
+  async fn live_demo_stream_plays_through_sink() {
+    use crate::infra::audio::LocalPlayer;
+    use std::time::Duration;
+
+    let source = SubsonicSource::new("https://demo.navidrome.org", "demo", "demo");
+    let playlists = source.playlists().await.expect("playlists should load");
+    let tracks = source
+      .tracks(&playlists[0].uri)
+      .await
+      .expect("tracks should load");
+    let uri = tracks[0].uri.as_deref().expect("track should have a uri");
+    let track_id = track_id_from_uri(uri).expect("uri should be a subsonic track uri");
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    source
+      .download_track(track_id, tmp.path())
+      .await
+      .expect("download should succeed");
+
+    let player = LocalPlayer::new().expect("open default output device");
+    player.play_file(tmp.path()).expect("play streamed track");
+    assert!(!player.is_paused(), "should be playing after play_file");
+    assert!(
+      !player.is_finished(),
+      "a freshly started track should not be finished"
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+      player.position() >= Duration::from_millis(200),
+      "playback position should advance, got {:?}",
+      player.position()
+    );
+
+    player.stop();
+  }
 
   // Inline JSON fixtures — representative Subsonic REST API responses.
 

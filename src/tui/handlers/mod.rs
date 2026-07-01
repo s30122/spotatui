@@ -245,14 +245,20 @@ pub fn handle_app(key: Key, app: &mut App) {
         app.input_context = InputContext::GlobalSearch;
         app.set_current_route_state(Some(ActiveBlock::Input), Some(ActiveBlock::Input));
       } else {
-        app.set_status_message("Search isn't available for Local Files", 4);
+        app.set_status_message(
+          format!("Search isn't available for {}", app.active_source.label()),
+          4,
+        );
       }
     }
     _ if key == app.user_config.keys.copy_song_url => {
       if app.active_source.supports_library() {
         app.copy_song_url();
       } else {
-        app.set_status_message("Copy URL isn't available for Local Files", 4);
+        app.set_status_message(
+          format!("Copy URL isn't available for {}", app.active_source.label()),
+          4,
+        );
       }
     }
     _ if key == app.user_config.keys.copy_album_url => {
@@ -284,7 +290,10 @@ pub fn handle_app(key: Key, app: &mut App) {
       } else if app.active_source.supports_like() {
         playbar::toggle_like_currently_playing_item(app);
       } else {
-        app.set_status_message("Like isn't available for Local Files", 4);
+        app.set_status_message(
+          format!("Like isn't available for {}", app.active_source.label()),
+          4,
+        );
       }
     }
     #[cfg(feature = "scripting")]

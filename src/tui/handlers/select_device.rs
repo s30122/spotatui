@@ -98,18 +98,26 @@ fn select_source(app: &mut App) {
     }
     // Reset the sidebar playlist cursor to the top of the new source's list.
     app.selected_playlist_index = Some(0);
-    if source == Source::Local {
-      // Populate the sidebar with local folders for the newly active source.
-      app.local_playlists_index = 0;
-      app.dispatch(IoEvent::GetLocalPlaylists);
+    match source {
+      Source::Local => {
+        // Populate the sidebar with local folders for the newly active source.
+        app.local_playlists_index = 0;
+        app.dispatch(IoEvent::GetLocalPlaylists);
+      }
+      Source::Subsonic => {
+        // Populate the sidebar with the server's playlists.
+        app.subsonic_playlists_index = 0;
+        app.dispatch(IoEvent::GetSubsonicPlaylists);
+      }
+      Source::Spotify => {}
     }
   }
   app.set_status_message(format!("Source: {}", source.label()), 4);
   app.pop_navigation_stack();
 
-  // If focus landed on a block the new source hides (the Library list under
-  // Local), move it to the local-folder Playlists block so input isn't lost.
-  if source == Source::Local {
+  // If focus landed on a block the new source hides (the Library list under any
+  // non-Spotify source), move it to the Playlists block so input isn't lost.
+  if source != Source::Spotify {
     let route = app.get_current_route();
     if route.active_block == ActiveBlock::Library || route.hovered_block == ActiveBlock::Library {
       app.set_current_route_state(Some(ActiveBlock::Empty), Some(ActiveBlock::MyPlaylists));

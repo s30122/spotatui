@@ -96,8 +96,8 @@ pub fn handler(key: Key, app: &mut App) {
           }
           TrackTableContext::AlbumSearch => {}
           TrackTableContext::DiscoverPlaylist => {}
-          // Local folders have no pagination.
-          TrackTableContext::LocalPlaylist => {}
+          // Local folders and Subsonic playlists have no pagination.
+          TrackTableContext::LocalPlaylist | TrackTableContext::SubsonicPlaylist => {}
         }
       };
     }
@@ -114,8 +114,8 @@ pub fn handler(key: Key, app: &mut App) {
           }
           TrackTableContext::AlbumSearch => {}
           TrackTableContext::DiscoverPlaylist => {}
-          // Local folders have no pagination.
-          TrackTableContext::LocalPlaylist => {}
+          // Local folders and Subsonic playlists have no pagination.
+          TrackTableContext::LocalPlaylist | TrackTableContext::SubsonicPlaylist => {}
         }
       };
     }
@@ -256,8 +256,8 @@ fn play_random_song(app: &mut App) {
           ));
         }
       }
-      TrackTableContext::LocalPlaylist => {
-        // Single-file local playback: play one random track from the folder.
+      TrackTableContext::LocalPlaylist | TrackTableContext::SubsonicPlaylist => {
+        // Single-file playback: play one random track from the folder/playlist.
         let playable_ids: Vec<String> = app
           .track_table
           .tracks
@@ -395,14 +395,15 @@ fn on_enter(app: &mut App) {
           ));
         }
       }
-      TrackTableContext::LocalPlaylist => {
-        // Queue the whole folder (in the displayed scan order) and start at the
-        // selected track, so local Next/Previous/auto-advance have a queue to
-        // move through. Routed to the local player by infra::local::dispatch.
+      TrackTableContext::LocalPlaylist | TrackTableContext::SubsonicPlaylist => {
+        // Queue the whole folder/playlist (in displayed order) and start at the
+        // selected track, so Next/Previous/auto-advance have a queue to move
+        // through. Routed to the local or subsonic player by URI scheme
+        // (infra::local::dispatch / infra::subsonic::dispatch).
         let uris: Vec<String> = tracks.iter().filter_map(|t| t.uri.clone()).collect();
         if !uris.is_empty() {
           // `selected_index` is into the full track list; the filter above keeps
-          // every local track (each carries a file:// uri), so the index lines up.
+          // every track (each carries a uri), so the index lines up.
           app.dispatch(IoEvent::StartPlayback(
             None,
             Some(uris),
@@ -473,6 +474,8 @@ fn on_queue(app: &mut App) {
           }
         }
       }
+      // Subsonic queue-append needs an active subsonic session (wired in M3).
+      TrackTableContext::SubsonicPlaylist => {}
     }
   };
 }

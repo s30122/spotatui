@@ -765,6 +765,9 @@ pub struct BehaviorConfigString {
   pub enable_media_keys: Option<bool>,
   pub sync_token: Option<String>,
   pub local_music_path: Option<String>,
+  pub subsonic_url: Option<String>,
+  pub subsonic_username: Option<String>,
+  pub subsonic_password: Option<String>,
 }
 
 #[derive(Clone)]
@@ -819,6 +822,15 @@ pub struct BehaviorConfig {
   /// Filesystem path to the local music library root (browsed by the Local
   /// Files screen). Defaults to the OS music directory; `None` if unavailable.
   pub local_music_path: Option<String>,
+  /// Base URL of the Subsonic/OpenSubsonic server (e.g.
+  /// `https://demo.navidrome.org`). `None` until configured.
+  pub subsonic_url: Option<String>,
+  /// Subsonic account username.
+  pub subsonic_username: Option<String>,
+  /// Subsonic account password. **Stored in plaintext in the YAML config** —
+  /// prefer the `SPOTATUI_SUBSONIC_PASSWORD` environment variable, which
+  /// overrides this field at connection time and is never written to disk.
+  pub subsonic_password: Option<String>,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -953,6 +965,9 @@ impl UserConfig {
         enable_media_keys: true,
         sync_token: None,
         local_music_path: dirs::audio_dir().map(|p| p.to_string_lossy().to_string()),
+        subsonic_url: None,
+        subsonic_username: None,
+        subsonic_password: None,
       },
       path_to_config: None,
     }
@@ -1319,6 +1334,26 @@ impl UserConfig {
         Some(trimmed.to_string())
       };
     }
+    // Subsonic server config: trim-to-None so blank keys read as unset.
+    let trim_to_none = |value: Option<String>| -> Option<String> {
+      value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+          None
+        } else {
+          Some(trimmed.to_string())
+        }
+      })
+    };
+    if let Some(subsonic_url) = trim_to_none(behavior_config.subsonic_url) {
+      self.behavior.subsonic_url = Some(subsonic_url);
+    }
+    if let Some(subsonic_username) = trim_to_none(behavior_config.subsonic_username) {
+      self.behavior.subsonic_username = Some(subsonic_username);
+    }
+    if let Some(subsonic_password) = trim_to_none(behavior_config.subsonic_password) {
+      self.behavior.subsonic_password = Some(subsonic_password);
+    }
     Ok(())
   }
 
@@ -1470,6 +1505,9 @@ impl UserConfig {
       relay_server_url: Some(self.behavior.relay_server_url.clone()),
       sync_token: self.behavior.sync_token.clone(),
       local_music_path: self.behavior.local_music_path.clone(),
+      subsonic_url: self.behavior.subsonic_url.clone(),
+      subsonic_username: self.behavior.subsonic_username.clone(),
+      subsonic_password: self.behavior.subsonic_password.clone(),
       stop_after_current_track: Some(self.behavior.stop_after_current_track),
       sidebar_width_percent: Some(self.behavior.sidebar_width_percent),
       playbar_height_rows: Some(self.behavior.playbar_height_rows),
@@ -2020,7 +2058,7 @@ mod tests {
     use crate::core::source::Source;
 
     // Unknown/garbage strings must not panic and fall back to Spotify
-    assert_eq!(Source::from_config_str("Subsonic"), Source::Spotify);
+    assert_eq!(Source::from_config_str("Tidal"), Source::Spotify);
     assert_eq!(Source::from_config_str(""), Source::Spotify);
     assert_eq!(Source::from_config_str("local"), Source::Spotify); // case-sensitive
   }
