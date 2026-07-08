@@ -15,8 +15,9 @@ use tokio::sync::Mutex;
 
 const HISTORY_SUBDIR: &str = "history";
 const LISTENS_FILE_NAME: &str = "listens.jsonl";
-const CLOUD_SYNC_URL: &str = "https://spotatui.com/api/sync";
-const NOW_PLAYING_SYNC_URL: &str = "https://spotatui.com/api/sync/now-playing";
+const SYNC_BASE_URL: &str = "https://spotatui.com";
+const CLOUD_SYNC_PATH: &str = "/api/sync";
+const NOW_PLAYING_SYNC_PATH: &str = "/api/sync/now-playing";
 /// Heartbeat interval: must be well under the 5-minute online threshold used by the website.
 const NOW_PLAYING_HEARTBEAT_SECS: u64 = 60;
 /// Push immediately when observed progress deviates this far from the progress
@@ -132,17 +133,23 @@ enum NowPlayingAction {
   Clear,
 }
 
+/// State captured at the last push; `Some` exactly while the cloud holds
+/// now-playing state for this session.
+struct PushedState {
+  title: String,
+  artists: Vec<String>,
+  is_playing: bool,
+  progress_ms: u128,
+  at: Instant,
+}
+
 /// Decides when the cloud now-playing state needs an update. Pushes on track
 /// change, play/pause flip, seek discontinuity, and a heartbeat (also while
 /// paused, so the public widget can show "paused" instead of decaying to
 /// offline); clears once when track playback stops mid-session.
 #[derive(Default)]
 struct NowPlayingTracker {
-  last_identity: Option<(String, Vec<String>)>,
-  last_is_playing: Option<bool>,
-  last_progress: Option<(u128, Instant)>,
-  last_heartbeat: Option<Instant>,
-  cloud_has_state: bool,
+  pushed: Option<PushedState>,
 }
 
 impl NowPlayingTracker {
@@ -150,47 +157,41 @@ impl NowPlayingTracker {
     &mut self,
     snapshot: Option<&PlaybackSnapshot>,
     now: Instant,
-    now_ms: i64,
   ) -> Option<NowPlayingAction> {
     let snap = snapshot.filter(|s| s.item_kind == PlaybackItemKind::Track);
     let Some(snap) = snap else {
-      if self.cloud_has_state {
-        *self = Self::default();
-        return Some(NowPlayingAction::Clear);
-      }
-      self.last_identity = None;
-      return None;
+      return self.pushed.take().map(|_| NowPlayingAction::Clear);
     };
 
-    let identity = (snap.metadata.title.clone(), snap.metadata.artists.clone());
-    let identity_changed = self.last_identity.as_ref() != Some(&identity);
-    let play_state_changed = self
-      .last_is_playing
-      .is_some_and(|was_playing| was_playing != snap.is_playing);
-    let heartbeat_due = self
-      .last_heartbeat
-      .map(|t| now.duration_since(t).as_secs() >= NOW_PLAYING_HEARTBEAT_SECS)
-      .unwrap_or(false);
-    let seek_detected = match self.last_progress {
-      Some((pushed_progress, pushed_at)) => {
-        let expected = if self.last_is_playing == Some(true) {
-          pushed_progress + now.duration_since(pushed_at).as_millis()
+    let should_push = match &self.pushed {
+      None => true,
+      Some(pushed) => {
+        let identity_changed =
+          pushed.title != snap.metadata.title || pushed.artists != snap.metadata.artists;
+        let play_state_changed = pushed.is_playing != snap.is_playing;
+        let heartbeat_due = now.duration_since(pushed.at).as_secs() >= NOW_PLAYING_HEARTBEAT_SECS;
+        let expected_progress = if pushed.is_playing {
+          pushed.progress_ms + now.duration_since(pushed.at).as_millis()
         } else {
-          pushed_progress
+          pushed.progress_ms
         };
-        snap.progress_ms.abs_diff(expected) > NOW_PLAYING_SEEK_THRESHOLD_MS
+        let seek_detected =
+          snap.progress_ms.abs_diff(expected_progress) > NOW_PLAYING_SEEK_THRESHOLD_MS;
+        identity_changed || play_state_changed || heartbeat_due || seek_detected
       }
-      None => false,
     };
 
-    if identity_changed || play_state_changed || heartbeat_due || seek_detected {
-      self.last_identity = Some(identity);
-      self.last_is_playing = Some(snap.is_playing);
-      self.last_progress = Some((snap.progress_ms, now));
-      self.last_heartbeat = Some(now);
-      self.cloud_has_state = true;
+    if should_push {
+      self.pushed = Some(PushedState {
+        title: snap.metadata.title.clone(),
+        artists: snap.metadata.artists.clone(),
+        is_playing: snap.is_playing,
+        progress_ms: snap.progress_ms,
+        at: now,
+      });
       return Some(NowPlayingAction::Push(NowPlayingPayload::from_snapshot(
-        snap, now_ms,
+        snap,
+        Utc::now().timestamp_millis(),
       )));
     }
     None
@@ -253,11 +254,7 @@ pub fn spawn_history_collector(app: Arc<Mutex<App>>) {
       // Now-playing sync: push on track change, play/pause flip, seek, or
       // heartbeat; clear once when track playback stops.
       if let Some(ref token) = sync_token_opt {
-        let action = now_playing_tracker.observe(
-          snapshot.as_ref(),
-          Instant::now(),
-          Utc::now().timestamp_millis(),
-        );
+        let action = now_playing_tracker.observe(snapshot.as_ref(), Instant::now());
         match action {
           Some(NowPlayingAction::Push(payload)) => {
             let token_clone = token.clone();
@@ -1619,13 +1616,12 @@ fn last_synced_file_path() -> Result<PathBuf> {
 
 /// Resolve a sync endpoint, honoring the `SPOTATUI_SYNC_BASE_URL` override
 /// (useful for pointing the client at a local backend during development).
-fn resolve_sync_url(default_url: &str, path: &str) -> String {
-  match std::env::var(SYNC_BASE_URL_ENV_KEY) {
-    Ok(base) if !base.trim().is_empty() => {
-      format!("{}{}", base.trim().trim_end_matches('/'), path)
-    }
-    _ => default_url.to_string(),
-  }
+fn resolve_sync_url(path: &str) -> String {
+  let base = match std::env::var(SYNC_BASE_URL_ENV_KEY) {
+    Ok(base) if !base.trim().is_empty() => base.trim().trim_end_matches('/').to_string(),
+    _ => SYNC_BASE_URL.to_string(),
+  };
+  format!("{}{}", base, path)
 }
 
 /// Post the current now-playing state to the cloud dashboard / public widget.
@@ -1636,10 +1632,7 @@ async fn sync_now_playing_to_cloud(
   payload: &NowPlayingPayload,
 ) -> Result<()> {
   let response = client
-    .post(resolve_sync_url(
-      NOW_PLAYING_SYNC_URL,
-      "/api/sync/now-playing",
-    ))
+    .post(resolve_sync_url(NOW_PLAYING_SYNC_PATH))
     .header("Authorization", format!("Bearer {}", sync_token))
     .json(payload)
     .send()
@@ -1656,10 +1649,7 @@ async fn sync_now_playing_to_cloud(
 /// Clear the now-playing status (playback stopped or the TUI is exiting).
 async fn clear_now_playing_with_client(client: &reqwest::Client, sync_token: &str) -> Result<()> {
   let response = client
-    .delete(resolve_sync_url(
-      NOW_PLAYING_SYNC_URL,
-      "/api/sync/now-playing",
-    ))
+    .delete(resolve_sync_url(NOW_PLAYING_SYNC_PATH))
     .header("Authorization", format!("Bearer {}", sync_token))
     .send()
     .await?;
@@ -1681,7 +1671,7 @@ pub async fn clear_now_playing_from_cloud(sync_token: &str) -> Result<()> {
   .await
 }
 
-/// Internal helper used by the history collector's shared HTTP client.
+/// Sync new listen records to the cloud using the given HTTP client.
 async fn sync_history_to_cloud_with_client(
   client: &reqwest::Client,
   sync_token: &str,
@@ -1708,7 +1698,7 @@ async fn sync_history_to_cloud_with_client(
   }
 
   let response = client
-    .post(resolve_sync_url(CLOUD_SYNC_URL, "/api/sync"))
+    .post(resolve_sync_url(CLOUD_SYNC_PATH))
     .header("Authorization", format!("Bearer {}", sync_token))
     .json(&new_listens)
     .send()
@@ -1737,56 +1727,11 @@ async fn sync_history_to_cloud_with_client(
 }
 
 pub async fn sync_history_to_cloud(sync_token: &str) -> Result<()> {
-  let path = last_synced_file_path()?;
-
-  use chrono::TimeZone;
-  let last_synced_at = match fs::read_to_string(&path) {
-    Ok(content) => DateTime::parse_from_rfc3339(content.trim())
-      .map(|dt| dt.with_timezone(&Utc))
-      .unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap()),
-    Err(_) => Utc.timestamp_opt(0, 0).unwrap(),
-  };
-
-  let listens = load_listens()?;
-  let new_listens: Vec<&ListenRecord> = listens
-    .iter()
-    .filter(|record| record.ended_at > last_synced_at)
-    .collect();
-
-  if new_listens.is_empty() {
-    log::info!("no new listening history records to sync");
-    return Ok(());
-  }
-
-  let client = reqwest::Client::new();
-
-  let response = client
-    .post(resolve_sync_url(CLOUD_SYNC_URL, "/api/sync"))
-    .header("Authorization", format!("Bearer {}", sync_token))
-    .json(&new_listens)
-    .send()
-    .await?;
-
-  if response.status().is_success() {
-    if let Some(last_record) = new_listens.last() {
-      fs::write(&path, last_record.ended_at.to_rfc3339())?;
-    }
-    log::info!(
-      "successfully synchronized listening history to cloud ({} tracks)",
-      new_listens.len()
-    );
-  } else {
-    let status = response.status();
-    let err_body = response.text().await.unwrap_or_default();
-    log::warn!(
-      "failed to synchronize history: {} (status {})",
-      err_body,
-      status
-    );
-    return Err(anyhow!("Sync failed: {}", err_body));
-  }
-
-  Ok(())
+  sync_history_to_cloud_with_client(
+    crate::infra::network::requests::shared_http_client(),
+    sync_token,
+  )
+  .await
 }
 
 #[cfg(test)]
@@ -1831,13 +1776,16 @@ mod tests {
 
   #[test]
   fn cloud_sync_uses_public_spotatui_domain() {
-    assert_eq!(CLOUD_SYNC_URL, "https://spotatui.com/api/sync");
+    assert_eq!(
+      resolve_sync_url(CLOUD_SYNC_PATH),
+      "https://spotatui.com/api/sync"
+    );
   }
 
   #[test]
   fn now_playing_uses_public_spotatui_domain() {
     assert_eq!(
-      NOW_PLAYING_SYNC_URL,
+      resolve_sync_url(NOW_PLAYING_SYNC_PATH),
       "https://spotatui.com/api/sync/now-playing"
     );
   }
@@ -1915,20 +1863,19 @@ mod tests {
     let mut tracker = NowPlayingTracker::default();
     let t0 = Instant::now();
     assert!(matches!(
-      tracker.observe(Some(&snapshot("One", true)), t0, 0),
+      tracker.observe(Some(&snapshot("One", true)), t0),
       Some(NowPlayingAction::Push(_))
     ));
     // Same track one second later, progress advancing in step: no push.
     let mut later = snapshot("One", true);
     later.progress_ms = 11_000;
     assert!(tracker
-      .observe(Some(&later), t0 + std::time::Duration::from_secs(1), 0)
+      .observe(Some(&later), t0 + std::time::Duration::from_secs(1))
       .is_none());
     assert!(matches!(
       tracker.observe(
         Some(&snapshot("Two", true)),
-        t0 + std::time::Duration::from_secs(2),
-        0
+        t0 + std::time::Duration::from_secs(2)
       ),
       Some(NowPlayingAction::Push(_))
     ));
@@ -1938,11 +1885,10 @@ mod tests {
   fn tracker_pushes_on_play_pause_flip() {
     let mut tracker = NowPlayingTracker::default();
     let t0 = Instant::now();
-    tracker.observe(Some(&snapshot("One", true)), t0, 0);
+    tracker.observe(Some(&snapshot("One", true)), t0);
     let action = tracker.observe(
       Some(&snapshot("One", false)),
       t0 + std::time::Duration::from_secs(1),
-      0,
     );
     assert!(matches!(
       action,
@@ -1954,11 +1900,10 @@ mod tests {
   fn tracker_heartbeats_even_when_paused() {
     let mut tracker = NowPlayingTracker::default();
     let t0 = Instant::now();
-    tracker.observe(Some(&snapshot("One", false)), t0, 0);
+    tracker.observe(Some(&snapshot("One", false)), t0);
     let action = tracker.observe(
       Some(&snapshot("One", false)),
       t0 + std::time::Duration::from_secs(NOW_PLAYING_HEARTBEAT_SECS + 1),
-      0,
     );
     assert!(matches!(action, Some(NowPlayingAction::Push(_))));
   }
@@ -1967,10 +1912,10 @@ mod tests {
   fn tracker_pushes_on_seek_discontinuity() {
     let mut tracker = NowPlayingTracker::default();
     let t0 = Instant::now();
-    tracker.observe(Some(&snapshot("One", true)), t0, 0);
+    tracker.observe(Some(&snapshot("One", true)), t0);
     let mut seeked = snapshot("One", true);
     seeked.progress_ms = 120_000;
-    let action = tracker.observe(Some(&seeked), t0 + std::time::Duration::from_secs(2), 0);
+    let action = tracker.observe(Some(&seeked), t0 + std::time::Duration::from_secs(2));
     assert!(matches!(action, Some(NowPlayingAction::Push(_))));
   }
 
@@ -1978,21 +1923,13 @@ mod tests {
   fn tracker_clears_once_when_playback_stops() {
     let mut tracker = NowPlayingTracker::default();
     let t0 = Instant::now();
-    tracker.observe(Some(&snapshot("One", true)), t0, 0);
+    tracker.observe(Some(&snapshot("One", true)), t0);
     assert!(matches!(
-      tracker.observe(None, t0 + std::time::Duration::from_secs(1), 0),
+      tracker.observe(None, t0 + std::time::Duration::from_secs(1)),
       Some(NowPlayingAction::Clear)
     ));
     assert!(tracker
-      .observe(None, t0 + std::time::Duration::from_secs(2), 0)
+      .observe(None, t0 + std::time::Duration::from_secs(2))
       .is_none());
-  }
-
-  #[test]
-  fn sync_url_falls_back_to_default_without_env() {
-    assert_eq!(
-      resolve_sync_url(NOW_PLAYING_SYNC_URL, "/api/sync/now-playing"),
-      NOW_PLAYING_SYNC_URL
-    );
   }
 }
