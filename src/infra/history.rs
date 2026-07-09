@@ -15,10 +15,15 @@ use tokio::sync::Mutex;
 
 const HISTORY_SUBDIR: &str = "history";
 const LISTENS_FILE_NAME: &str = "listens.jsonl";
-const CLOUD_SYNC_URL: &str = "https://spotatui.com/api/sync";
-const NOW_PLAYING_SYNC_URL: &str = "https://spotatui.com/api/sync/now-playing";
+const SYNC_BASE_URL: &str = "https://spotatui.com";
+const CLOUD_SYNC_PATH: &str = "/api/sync";
+const NOW_PLAYING_SYNC_PATH: &str = "/api/sync/now-playing";
 /// Heartbeat interval: must be well under the 5-minute online threshold used by the website.
 const NOW_PLAYING_HEARTBEAT_SECS: u64 = 60;
+/// Push immediately when observed progress deviates this far from the progress
+/// expected since the last push (a seek), keeping the widget's bar honest.
+const NOW_PLAYING_SEEK_THRESHOLD_MS: u128 = 5_000;
+const SYNC_BASE_URL_ENV_KEY: &str = "SPOTATUI_SYNC_BASE_URL";
 const MAX_INTERVAL_MS: u64 = 5_000;
 const REPLAY_RESET_THRESHOLD_MS: u128 = 15_000;
 const REPLAY_PREVIOUS_PROGRESS_FLOOR_MS: u128 = 30_000;
@@ -90,10 +95,107 @@ struct HistoryCollector {
   last_observed_at: Option<Instant>,
 }
 
-#[derive(Serialize)]
-struct NowPlayingPayload<'a> {
-  title: &'a str,
-  artists: &'a [String],
+#[derive(Clone, Debug, Serialize)]
+struct NowPlayingPayload {
+  title: String,
+  artists: Vec<String>,
+  album: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  image_url: Option<String>,
+  duration_ms: u32,
+  progress_ms: u64,
+  is_playing: bool,
+  is_live: bool,
+  /// Client Unix millis when `progress_ms` was sampled, so the backend can
+  /// extrapolate the widget's progress bar between heartbeats.
+  progress_at_ms: i64,
+}
+
+impl NowPlayingPayload {
+  fn from_snapshot(snapshot: &PlaybackSnapshot, sampled_at_ms: i64) -> Self {
+    Self {
+      title: snapshot.metadata.title.clone(),
+      artists: snapshot.metadata.artists.clone(),
+      album: snapshot.metadata.album.clone(),
+      image_url: snapshot.metadata.image_url.clone(),
+      duration_ms: snapshot.metadata.duration_ms,
+      progress_ms: snapshot.progress_ms.min(u64::MAX as u128) as u64,
+      is_playing: snapshot.is_playing,
+      is_live: snapshot.is_live,
+      progress_at_ms: sampled_at_ms,
+    }
+  }
+}
+
+#[derive(Debug)]
+enum NowPlayingAction {
+  Push(NowPlayingPayload),
+  Clear,
+}
+
+/// State captured at the last push; `Some` exactly while the cloud holds
+/// now-playing state for this session.
+struct PushedState {
+  title: String,
+  artists: Vec<String>,
+  is_playing: bool,
+  progress_ms: u128,
+  at: Instant,
+}
+
+/// Decides when the cloud now-playing state needs an update. Pushes on track
+/// change, play/pause flip, seek discontinuity, and a heartbeat (also while
+/// paused, so the public widget can show "paused" instead of decaying to
+/// offline); clears once when track playback stops mid-session.
+#[derive(Default)]
+struct NowPlayingTracker {
+  pushed: Option<PushedState>,
+}
+
+impl NowPlayingTracker {
+  fn observe(
+    &mut self,
+    snapshot: Option<&PlaybackSnapshot>,
+    now: Instant,
+  ) -> Option<NowPlayingAction> {
+    let snap = snapshot.filter(|s| s.item_kind == PlaybackItemKind::Track);
+    let Some(snap) = snap else {
+      return self.pushed.take().map(|_| NowPlayingAction::Clear);
+    };
+
+    let should_push = match &self.pushed {
+      None => true,
+      Some(pushed) => {
+        let identity_changed =
+          pushed.title != snap.metadata.title || pushed.artists != snap.metadata.artists;
+        let play_state_changed = pushed.is_playing != snap.is_playing;
+        let heartbeat_due = now.duration_since(pushed.at).as_secs() >= NOW_PLAYING_HEARTBEAT_SECS;
+        let expected_progress = if pushed.is_playing {
+          pushed.progress_ms + now.duration_since(pushed.at).as_millis()
+        } else {
+          pushed.progress_ms
+        };
+        let seek_detected =
+          snap.progress_ms.abs_diff(expected_progress) > NOW_PLAYING_SEEK_THRESHOLD_MS;
+        identity_changed || play_state_changed || heartbeat_due || seek_detected
+      }
+    };
+
+    if should_push {
+      self.pushed = Some(PushedState {
+        title: snap.metadata.title.clone(),
+        artists: snap.metadata.artists.clone(),
+        is_playing: snap.is_playing,
+        progress_ms: snap.progress_ms,
+        at: now,
+      });
+      return Some(NowPlayingAction::Push(NowPlayingPayload::from_snapshot(
+        snap,
+        Utc::now().timestamp_millis(),
+      )));
+    }
+    None
+  }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,7 +212,7 @@ pub fn spawn_history_collector(app: Arc<Mutex<App>>) {
     let mut collector = HistoryCollector::default();
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
     let mut last_auto_check = Instant::now();
-    let http_client = reqwest::Client::new();
+    let http_client = crate::infra::network::requests::shared_http_client().clone();
 
     // Check on startup
     perform_auto_recap_check(&app);
@@ -133,8 +235,7 @@ pub fn spawn_history_collector(app: Arc<Mutex<App>>) {
     }
 
     // Now-playing tracking state
-    let mut last_now_playing: Option<(String, Vec<String>)> = None;
-    let mut last_heartbeat: Option<Instant> = None;
+    let mut now_playing_tracker = NowPlayingTracker::default();
 
     loop {
       interval.tick().await;
@@ -150,38 +251,30 @@ pub fn spawn_history_collector(app: Arc<Mutex<App>>) {
         continue;
       };
 
-      // Now-playing sync: update on track change and heartbeat while playing
+      // Now-playing sync: push on track change, play/pause flip, seek, or
+      // heartbeat; clear once when track playback stops.
       if let Some(ref token) = sync_token_opt {
-        let snap_for_np = snapshot
-          .as_ref()
-          .filter(|s| s.item_kind == PlaybackItemKind::Track);
-        match snap_for_np {
-          Some(snap) => {
-            let current_id = (snap.metadata.title.clone(), snap.metadata.artists.clone());
-            let track_changed = last_now_playing.as_ref() != Some(&current_id);
-            let heartbeat_due = snap.is_playing
-              && last_heartbeat
-                .map(|t| t.elapsed().as_secs() >= NOW_PLAYING_HEARTBEAT_SECS)
-                .unwrap_or(false);
-
-            if track_changed || heartbeat_due {
-              last_now_playing = Some(current_id.clone());
-              last_heartbeat = Some(Instant::now());
-              let token_clone = token.clone();
-              let client = http_client.clone();
-              let (title, artists) = current_id;
-              tokio::spawn(async move {
-                if let Err(e) =
-                  sync_now_playing_to_cloud(&client, &token_clone, &title, &artists).await
-                {
-                  log::warn!("failed to sync now-playing: {}", e);
-                }
-              });
-            }
+        let action = now_playing_tracker.observe(snapshot.as_ref(), Instant::now());
+        match action {
+          Some(NowPlayingAction::Push(payload)) => {
+            let token_clone = token.clone();
+            let client = http_client.clone();
+            tokio::spawn(async move {
+              if let Err(e) = sync_now_playing_to_cloud(&client, &token_clone, &payload).await {
+                log::warn!("failed to sync now-playing: {}", e);
+              }
+            });
           }
-          None => {
-            last_now_playing = None;
+          Some(NowPlayingAction::Clear) => {
+            let token_clone = token.clone();
+            let client = http_client.clone();
+            tokio::spawn(async move {
+              if let Err(e) = clear_now_playing_with_client(&client, &token_clone).await {
+                log::warn!("failed to clear now-playing: {}", e);
+              }
+            });
           }
+          None => {}
         }
       }
 
@@ -1521,19 +1614,27 @@ fn last_synced_file_path() -> Result<PathBuf> {
   )
 }
 
-/// Post the current now-playing track to the cloud dashboard.
+/// Resolve a sync endpoint, honoring the `SPOTATUI_SYNC_BASE_URL` override
+/// (useful for pointing the client at a local backend during development).
+fn resolve_sync_url(path: &str) -> String {
+  let base = match std::env::var(SYNC_BASE_URL_ENV_KEY) {
+    Ok(base) if !base.trim().is_empty() => base.trim().trim_end_matches('/').to_string(),
+    _ => SYNC_BASE_URL.to_string(),
+  };
+  format!("{}{}", base, path)
+}
+
+/// Post the current now-playing state to the cloud dashboard / public widget.
 /// Uses a shared HTTP client to reuse the connection pool across frequent calls.
 async fn sync_now_playing_to_cloud(
   client: &reqwest::Client,
   sync_token: &str,
-  title: &str,
-  artists: &[String],
+  payload: &NowPlayingPayload,
 ) -> Result<()> {
-  let payload = NowPlayingPayload { title, artists };
   let response = client
-    .post(NOW_PLAYING_SYNC_URL)
+    .post(resolve_sync_url(NOW_PLAYING_SYNC_PATH))
     .header("Authorization", format!("Bearer {}", sync_token))
-    .json(&payload)
+    .json(payload)
     .send()
     .await?;
 
@@ -1545,11 +1646,10 @@ async fn sync_now_playing_to_cloud(
   Ok(())
 }
 
-/// Clear the now-playing status when the TUI exits.
-pub async fn clear_now_playing_from_cloud(sync_token: &str) -> Result<()> {
-  let client = reqwest::Client::new();
+/// Clear the now-playing status (playback stopped or the TUI is exiting).
+async fn clear_now_playing_with_client(client: &reqwest::Client, sync_token: &str) -> Result<()> {
   let response = client
-    .delete(NOW_PLAYING_SYNC_URL)
+    .delete(resolve_sync_url(NOW_PLAYING_SYNC_PATH))
     .header("Authorization", format!("Bearer {}", sync_token))
     .send()
     .await?;
@@ -1562,7 +1662,16 @@ pub async fn clear_now_playing_from_cloud(sync_token: &str) -> Result<()> {
   Ok(())
 }
 
-/// Internal helper used by the history collector's shared HTTP client.
+/// Clear the now-playing status when the TUI exits.
+pub async fn clear_now_playing_from_cloud(sync_token: &str) -> Result<()> {
+  clear_now_playing_with_client(
+    crate::infra::network::requests::shared_http_client(),
+    sync_token,
+  )
+  .await
+}
+
+/// Sync new listen records to the cloud using the given HTTP client.
 async fn sync_history_to_cloud_with_client(
   client: &reqwest::Client,
   sync_token: &str,
@@ -1589,7 +1698,7 @@ async fn sync_history_to_cloud_with_client(
   }
 
   let response = client
-    .post(CLOUD_SYNC_URL)
+    .post(resolve_sync_url(CLOUD_SYNC_PATH))
     .header("Authorization", format!("Bearer {}", sync_token))
     .json(&new_listens)
     .send()
@@ -1618,56 +1727,11 @@ async fn sync_history_to_cloud_with_client(
 }
 
 pub async fn sync_history_to_cloud(sync_token: &str) -> Result<()> {
-  let path = last_synced_file_path()?;
-
-  use chrono::TimeZone;
-  let last_synced_at = match fs::read_to_string(&path) {
-    Ok(content) => DateTime::parse_from_rfc3339(content.trim())
-      .map(|dt| dt.with_timezone(&Utc))
-      .unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap()),
-    Err(_) => Utc.timestamp_opt(0, 0).unwrap(),
-  };
-
-  let listens = load_listens()?;
-  let new_listens: Vec<&ListenRecord> = listens
-    .iter()
-    .filter(|record| record.ended_at > last_synced_at)
-    .collect();
-
-  if new_listens.is_empty() {
-    log::info!("no new listening history records to sync");
-    return Ok(());
-  }
-
-  let client = reqwest::Client::new();
-
-  let response = client
-    .post(CLOUD_SYNC_URL)
-    .header("Authorization", format!("Bearer {}", sync_token))
-    .json(&new_listens)
-    .send()
-    .await?;
-
-  if response.status().is_success() {
-    if let Some(last_record) = new_listens.last() {
-      fs::write(&path, last_record.ended_at.to_rfc3339())?;
-    }
-    log::info!(
-      "successfully synchronized listening history to cloud ({} tracks)",
-      new_listens.len()
-    );
-  } else {
-    let status = response.status();
-    let err_body = response.text().await.unwrap_or_default();
-    log::warn!(
-      "failed to synchronize history: {} (status {})",
-      err_body,
-      status
-    );
-    return Err(anyhow!("Sync failed: {}", err_body));
-  }
-
-  Ok(())
+  sync_history_to_cloud_with_client(
+    crate::infra::network::requests::shared_http_client(),
+    sync_token,
+  )
+  .await
 }
 
 #[cfg(test)]
@@ -1712,14 +1776,160 @@ mod tests {
 
   #[test]
   fn cloud_sync_uses_public_spotatui_domain() {
-    assert_eq!(CLOUD_SYNC_URL, "https://spotatui.com/api/sync");
+    assert_eq!(
+      resolve_sync_url(CLOUD_SYNC_PATH),
+      "https://spotatui.com/api/sync"
+    );
   }
 
   #[test]
   fn now_playing_uses_public_spotatui_domain() {
     assert_eq!(
-      NOW_PLAYING_SYNC_URL,
+      resolve_sync_url(NOW_PLAYING_SYNC_PATH),
       "https://spotatui.com/api/sync/now-playing"
     );
+  }
+
+  fn snapshot(title: &str, is_playing: bool) -> PlaybackSnapshot {
+    PlaybackSnapshot {
+      metadata: crate::infra::media_metadata::PlaybackMetadata {
+        title: title.to_string(),
+        artists: vec!["Artist".to_string()],
+        album: "Album".to_string(),
+        image_url: Some("https://i.scdn.co/image/abc".to_string()),
+        duration_ms: 200_000,
+      },
+      item_kind: PlaybackItemKind::Track,
+      item_id: None,
+      item_uri: None,
+      context_uri: None,
+      source: PlaybackSource::ExternalDevice,
+      progress_ms: 10_000,
+      is_playing,
+      is_live: false,
+      shuffle: false,
+      repeat: None,
+    }
+  }
+
+  #[test]
+  fn now_playing_payload_serializes_contract_fields() {
+    let payload = NowPlayingPayload::from_snapshot(&snapshot("Song", true), 1_700_000_000_000);
+    let value = serde_json::to_value(&payload).unwrap();
+    let object = value.as_object().unwrap();
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+      keys,
+      [
+        "album",
+        "artists",
+        "duration_ms",
+        "image_url",
+        "is_live",
+        "is_playing",
+        "progress_at_ms",
+        "progress_ms",
+        "title",
+      ]
+    );
+    assert_eq!(object["title"], "Song");
+    assert_eq!(object["artists"], serde_json::json!(["Artist"]));
+    assert_eq!(object["progress_at_ms"], 1_700_000_000_000_i64);
+  }
+
+  #[test]
+  fn now_playing_payload_omits_missing_image_url() {
+    let mut snap = snapshot("Song", true);
+    snap.metadata.image_url = None;
+    let value = serde_json::to_value(NowPlayingPayload::from_snapshot(&snap, 0)).unwrap();
+    assert!(value.as_object().unwrap().get("image_url").is_none());
+  }
+
+  #[test]
+  fn now_playing_payload_maps_live_radio_snapshot() {
+    let mut snap = snapshot("SomaFM Groove Salad", true);
+    snap.is_live = true;
+    snap.metadata.duration_ms = 0;
+    snap.metadata.image_url = None;
+    let payload = NowPlayingPayload::from_snapshot(&snap, 5);
+    assert!(payload.is_live);
+    assert_eq!(payload.duration_ms, 0);
+    assert!(payload.image_url.is_none());
+  }
+
+  #[test]
+  fn tracker_pushes_on_track_change_and_not_within_heartbeat() {
+    let mut tracker = NowPlayingTracker::default();
+    let t0 = Instant::now();
+    assert!(matches!(
+      tracker.observe(Some(&snapshot("One", true)), t0),
+      Some(NowPlayingAction::Push(_))
+    ));
+    // Same track one second later, progress advancing in step: no push.
+    let mut later = snapshot("One", true);
+    later.progress_ms = 11_000;
+    assert!(tracker
+      .observe(Some(&later), t0 + std::time::Duration::from_secs(1))
+      .is_none());
+    assert!(matches!(
+      tracker.observe(
+        Some(&snapshot("Two", true)),
+        t0 + std::time::Duration::from_secs(2)
+      ),
+      Some(NowPlayingAction::Push(_))
+    ));
+  }
+
+  #[test]
+  fn tracker_pushes_on_play_pause_flip() {
+    let mut tracker = NowPlayingTracker::default();
+    let t0 = Instant::now();
+    tracker.observe(Some(&snapshot("One", true)), t0);
+    let action = tracker.observe(
+      Some(&snapshot("One", false)),
+      t0 + std::time::Duration::from_secs(1),
+    );
+    assert!(matches!(
+      action,
+      Some(NowPlayingAction::Push(ref payload)) if !payload.is_playing
+    ));
+  }
+
+  #[test]
+  fn tracker_heartbeats_even_when_paused() {
+    let mut tracker = NowPlayingTracker::default();
+    let t0 = Instant::now();
+    tracker.observe(Some(&snapshot("One", false)), t0);
+    let action = tracker.observe(
+      Some(&snapshot("One", false)),
+      t0 + std::time::Duration::from_secs(NOW_PLAYING_HEARTBEAT_SECS + 1),
+    );
+    assert!(matches!(action, Some(NowPlayingAction::Push(_))));
+  }
+
+  #[test]
+  fn tracker_pushes_on_seek_discontinuity() {
+    let mut tracker = NowPlayingTracker::default();
+    let t0 = Instant::now();
+    tracker.observe(Some(&snapshot("One", true)), t0);
+    let mut seeked = snapshot("One", true);
+    seeked.progress_ms = 120_000;
+    let action = tracker.observe(Some(&seeked), t0 + std::time::Duration::from_secs(2));
+    assert!(matches!(action, Some(NowPlayingAction::Push(_))));
+  }
+
+  #[test]
+  fn tracker_clears_once_when_playback_stops() {
+    let mut tracker = NowPlayingTracker::default();
+    let t0 = Instant::now();
+    tracker.observe(Some(&snapshot("One", true)), t0);
+    assert!(matches!(
+      tracker.observe(None, t0 + std::time::Duration::from_secs(1)),
+      Some(NowPlayingAction::Clear)
+    ));
+    assert!(tracker
+      .observe(None, t0 + std::time::Duration::from_secs(2))
+      .is_none());
   }
 }

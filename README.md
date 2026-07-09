@@ -242,6 +242,16 @@ You can also override the app ID via `SPOTATUI_DISCORD_APP_ID`, or disable it in
 
 spotatui includes an opt-in global counter showing how many songs have been played by all users worldwide (the badge and chart at the top of this README). It is **completely anonymous** — no personal information, song names, artists, or listening history is collected; it only sends a simple increment when a new song starts. It is enabled by default and can be disabled with `enable_global_song_count: false` in `~/.config/spotatui/config.yml`. This is purely a fun community metric with zero tracking of individual users.
 
+### GitHub Profile Widget
+
+Show what you're listening to as a live card on your GitHub profile. Create an account at [spotatui.com](https://spotatui.com), paste your sync token into Settings → `sync_token`, then pick a public username and enable the widget on your dashboard. Add this to your profile README:
+
+```markdown
+[![Now playing on spotatui](https://spotatui.com/widget/your-username.svg)](https://spotatui.com)
+```
+
+The card shows cover art, title, artist, a progress bar, and an animated equalizer while playing; internet radio gets a LIVE badge. Append `?theme=light` for the light variant. Only your current track is public, and only after you opt in.
+
 ## Plugins
 
 spotatui runs user-written Lua plugins. They react to playback events, add commands and key bindings, draw popups and playbar segments, restyle the theme, and make async HTTP requests. Install one published as a git repository (requires `git`):
