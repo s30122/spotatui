@@ -567,6 +567,10 @@ pub struct TrackTable {
   pub tracks: Vec<TrackInfo>,
   pub selected_index: usize,
   pub context: Option<TrackTableContext>,
+  /// First row shown in the table. Persisted across frames so the cursor can
+  /// move within the visible window without dragging the view (the view only
+  /// scrolls when the cursor reaches an edge). Updated during draw, hence Cell.
+  pub scroll_offset: std::cell::Cell<usize>,
 }
 
 fn sort_playlist_track_matches(matches: &mut [(FullTrack, usize)], sort_state: SortState) {
