@@ -806,6 +806,7 @@ pub async fn start_ui(
         app.flush_pending_native_seek();
         app.flush_pending_api_seek();
         app.flush_pending_volume();
+        app.flush_config_save(false);
 
         #[cfg(feature = "scripting")]
         if let Some(engine) = script_engine.as_mut() {
@@ -1286,6 +1287,13 @@ pub async fn start_ui(
   if let Some(engine) = script_engine.as_mut() {
     let mut app = app.lock().await;
     engine.on_quit(&mut app);
+  }
+
+  // A volume/resize/shuffle change may still be inside its debounce window;
+  // persist it before the process exits.
+  {
+    let mut app = app.lock().await;
+    app.flush_config_save(true);
   }
 
   #[cfg(feature = "streaming")]

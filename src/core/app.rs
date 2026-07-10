@@ -1272,6 +1272,13 @@ pub struct App {
   /// When true, we hold off on sending another one — rapid key presses
   /// just update `pending_volume` and the latest value wins.
   pub is_volume_change_in_flight: bool,
+  /// Deadline for a debounced config save scheduled by an auto-repeating key
+  /// (volume, panel resize, shuffle). Those keys used to call `save_config()`
+  /// synchronously per repeat, paying a full read, YAML parse, rebuild,
+  /// serialize, and write on the UI thread, dozens of times per second while
+  /// held. The tick handler flushes this once the debounce window passes;
+  /// shutdown flushes it unconditionally.
+  pub config_save_due: Option<Instant>,
   /// Reference to the native streaming player for direct control (bypasses event channel)
   #[cfg(feature = "streaming")]
   pub streaming_player: Option<Arc<crate::infra::player::StreamingPlayer>>,
@@ -1564,6 +1571,7 @@ impl Default for App {
       playlist_tracks_prefetch_generation: 0,
       playlist_tracks_prefetch_in_flight: HashSet::new(),
       is_volume_change_in_flight: false,
+      config_save_due: None,
       pending_volume: None,
       last_dispatched_volume: None,
       #[cfg(feature = "streaming")]
@@ -2752,6 +2760,29 @@ impl App {
   ///
   /// We intentionally don't clear `pending_volume` here — it sticks around until
   /// `get_current_playback` sees the matching value come back from the API.
+  /// Schedule a debounced config save. Hot paths (volume, panel resize,
+  /// shuffle) call this instead of `save_config()` so a held key doesn't pay
+  /// disk + YAML work on every auto-repeat; the save lands once, shortly
+  /// after the last change.
+  pub fn schedule_config_save(&mut self) {
+    const CONFIG_SAVE_DEBOUNCE_MS: u64 = 500;
+    self.config_save_due = Some(Instant::now() + Duration::from_millis(CONFIG_SAVE_DEBOUNCE_MS));
+  }
+
+  /// Flush a scheduled config save once its debounce window has passed, or
+  /// immediately when `force` is set (shutdown).
+  pub fn flush_config_save(&mut self, force: bool) {
+    let Some(due) = self.config_save_due else {
+      return;
+    };
+    if force || Instant::now() >= due {
+      self.config_save_due = None;
+      if let Err(e) = self.user_config.save_config() {
+        self.handle_error(anyhow!("Failed to save config: {}", e));
+      }
+    }
+  }
+
   pub fn flush_pending_volume(&mut self) {
     if self.is_volume_change_in_flight {
       return; // previous request still processing
@@ -2822,7 +2853,7 @@ impl App {
       if self.active_decoded_source() {
         self.dispatch(IoEvent::ChangeVolume(next_volume));
         self.user_config.behavior.volume_percent = next_volume;
-        let _ = self.user_config.save_config();
+        self.schedule_config_save();
         self.pending_volume = Some(next_volume);
         return;
       }
@@ -2837,7 +2868,7 @@ impl App {
             ctx.device.volume_percent = Some(next_volume.into());
           }
           self.user_config.behavior.volume_percent = next_volume;
-          let _ = self.user_config.save_config();
+          self.schedule_config_save();
           self.pending_volume = Some(next_volume);
 
           // Notify MPRIS clients of the change (VolumeChanged is never emitted by
@@ -2878,7 +2909,7 @@ impl App {
       if self.active_decoded_source() {
         self.dispatch(IoEvent::ChangeVolume(next_volume));
         self.user_config.behavior.volume_percent = next_volume;
-        let _ = self.user_config.save_config();
+        self.schedule_config_save();
         self.pending_volume = Some(next_volume);
         return;
       }
@@ -2893,7 +2924,7 @@ impl App {
             ctx.device.volume_percent = Some(next_volume.into());
           }
           self.user_config.behavior.volume_percent = next_volume;
-          let _ = self.user_config.save_config();
+          self.schedule_config_save();
           self.pending_volume = Some(next_volume);
 
           // Notify MPRIS clients of the change (VolumeChanged is never emitted by
@@ -2939,7 +2970,7 @@ impl App {
       if self.active_decoded_source() {
         self.dispatch(IoEvent::ChangeVolume(next_volume_u8));
         self.user_config.behavior.volume_percent = next_volume_u8;
-        let _ = self.user_config.save_config();
+        self.schedule_config_save();
         self.pending_volume = Some(next_volume_u8);
         return;
       }
@@ -2954,7 +2985,7 @@ impl App {
             ctx.device.volume_percent = Some(next_volume_u8.into());
           }
           self.user_config.behavior.volume_percent = next_volume_u8;
-          let _ = self.user_config.save_config();
+          self.schedule_config_save();
           self.pending_volume = Some(next_volume_u8);
 
           // Notify MPRIS clients of the change (VolumeChanged is never emitted by
@@ -4417,7 +4448,7 @@ impl App {
             ctx.shuffle_state = new_shuffle_state;
           }
           self.user_config.behavior.shuffle_enabled = new_shuffle_state;
-          let _ = self.user_config.save_config();
+          self.schedule_config_save();
 
           // Notify MPRIS clients of the change
           #[cfg(all(feature = "mpris", target_os = "linux"))]
