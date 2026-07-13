@@ -1,7 +1,7 @@
 {
   "$schema": "https://context7.com/schema/context7.json",
   "projectTitle": "spotatui",
-  "description": "A Spotify terminal client (TUI) in Rust with native streaming, audio visualization, listening parties, Lua scripting, and alternative music sources (Local/Subsonic/Radio/YouTube).",
+  "description": "A fast, standalone terminal music player in Rust: native Spotify streaming plus local, Subsonic, radio, and YouTube sources.",
   "folders": [
     "docs",
     "examples"
