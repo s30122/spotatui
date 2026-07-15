@@ -114,6 +114,7 @@ impl UtilsNetwork for Network {
             }
             if !synced.is_empty() {
               app.lyrics = Some(synced);
+              app.lyrics_synced = true;
               app.lyrics_status = LyricsStatus::Found;
             } else if let Some(plain) = lrc_resp
               .plainLyrics
@@ -121,6 +122,7 @@ impl UtilsNetwork for Network {
               .filter(|text| !text.trim().is_empty())
             {
               app.lyrics = Some(synthesize_plain_lyrics(plain, duration));
+              app.lyrics_synced = false;
               app.lyrics_status = LyricsStatus::Found;
             } else {
               app.lyrics_status = LyricsStatus::NotFound;
