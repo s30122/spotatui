@@ -4033,10 +4033,12 @@ impl App {
   }
 
   /// Set the decoded shuffle to an explicit value from an external media
-  /// controller (MPRIS), reordering the active source's queue. Returns whether
-  /// a queueable decoded source consumed it, so the caller can skip the Spotify
-  /// path; `false` (leaving the event to the Spotify handler) when no such
-  /// source owns playback.
+  /// controller (MPRIS), reordering the active source's queue. Returns whether a
+  /// queueable decoded source consumed it. A `false` return does **not** mean
+  /// "hand this to Spotify": the caller rejects the request and corrects the
+  /// client's property instead, because reaching this method at all means a
+  /// decoded source (radio, or the queue slot) owns playback and the Spotify
+  /// context is not what the user is listening to.
   #[cfg(all(
     feature = "mpris",
     target_os = "linux",
@@ -5025,6 +5027,18 @@ impl App {
       return;
     }
 
+    // A decoded source owns playback but has no queue to shuffle: internet radio
+    // is an endless stream, and the native queue slot plays an explicit list over
+    // a suspended context. Both hide the shuffle button and blank shuffle in the
+    // MPRIS snapshot, so the key must no-op to match. Falling through would flip
+    // shuffle on the user's real Spotify device for a source they are not
+    // listening to, invisibly: the playbar on screen is the decoded one, so
+    // nothing would reflect the change.
+    if self.active_decoded_source() || self.queue_owns_playback() {
+      self.set_status_message("Shuffle does not apply to this source", 2);
+      return;
+    }
+
     if let Some(shuffle_state) = self
       .current_playback_context
       .as_ref()
@@ -5409,6 +5423,14 @@ impl App {
         RepeatMode::Track => "Repeat: One",
       };
       self.set_status_message(label, 2);
+      return;
+    }
+
+    // See `shuffle`: radio and the queue slot have no repeat of their own, and
+    // falling through would cycle repeat on the user's real Spotify device with
+    // nothing on screen to show for it.
+    if self.active_decoded_source() || self.queue_owns_playback() {
+      self.set_status_message("Repeat does not apply to this source", 2);
       return;
     }
 

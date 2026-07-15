@@ -49,6 +49,23 @@ pub struct LocalPlaybackState {
   /// queue is in natural order). Set by [`set_shuffle(true)`](Self::set_shuffle)
   /// and consumed by `set_shuffle(false)` to restore order + index exactly.
   pub shuffle_backup: Option<crate::infra::queue::ShuffleBackup>,
+  /// Indices of the tracks that have failed to play since the last successful
+  /// one, bounding the deliberate "skip past an unplayable file" behavior.
+  ///
+  /// Local playback leaves the session alive on a play failure so the tick moves
+  /// past the bad track. That self-terminates under `RepeatMode::Off` (the last
+  /// track has no next, so `advance_decision` reaches `Decision::Teardown`), but
+  /// `RepeatMode::Context` wraps forever and never yields `Teardown` — so with an
+  /// entirely unplayable queue (an unmounted share, an ejected drive) the tick
+  /// would re-fail every track at tick rate with no terminating state. Cleared on
+  /// every successful play; once it covers the whole queue there is nothing left
+  /// to play and the session is torn down instead. Same class of bounded guard as
+  /// `App::spotify_queue_guard_reloads`.
+  ///
+  /// Distinct indices rather than a failure count: a count would also trip on a
+  /// user skipping back and forth across the same two bad tracks, tearing down a
+  /// session whose remaining tracks play fine.
+  pub failed_since_played: std::collections::HashSet<usize>,
 }
 
 impl LocalPlaybackState {
@@ -57,6 +74,9 @@ impl LocalPlaybackState {
   /// semantics (current track stays playing at the front; un-shuffle restores
   /// order + index; idempotent).
   pub fn set_shuffle(&mut self, on: bool) {
+    // The permutation moves every track, so remembered failures no longer name
+    // the tracks that failed.
+    self.failed_since_played.clear();
     crate::infra::queue::toggle_shuffle(
       &mut self.queue,
       &mut self.index,

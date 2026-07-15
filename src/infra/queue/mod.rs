@@ -174,19 +174,28 @@ pub enum SuspendCause {
 /// The index a decoded context should resume at once the native queue drains,
 /// having been suspended with skip semantics (resume at position 0).
 ///
-/// Differs from [`advance_index`] in exactly one case: an [`SuspendCause::AutoAdvance`]
-/// handoff under [`RepeatMode::Track`] resumes *the same track*, because the
-/// context is repeating it and a queued song must not consume the repeat.
-/// [`advance_decision`] returns [`Decision::SuspendToQueue`] before it ever
-/// consults `repeat`, so this is the only thing keeping repeat-one alive across
-/// the queue: without it the repeated track is skipped, and on the last track
-/// `advance_index` returns `None`, which reads as "context exhausted" and tears
-/// the whole context down.
+/// `None` means something different here than it does in [`advance_index`], and
+/// that is the whole reason this function exists. To `advance_index`, `None` is
+/// "clamp: the skip is a no-op, keep playing". To every caller of *this*
+/// function it is "context exhausted: tear it down and stop" (see the
+/// `let Some(index) = resume_index else { … }` arms in [`dispatch`]). The two
+/// readings coincide only under [`RepeatMode::Off`], where exhaustion really is
+/// the right end state — so under [`RepeatMode::Track`] this never returns
+/// `None` for an in-range `current`: repeat-one's contract is that the context
+/// never ends.
 ///
-/// A [`SuspendCause::ManualSkip`] handoff advances even under repeat-one — the
-/// user asked to move on, and the per-source skip paths treat repeat-one as a
-/// normal clamp/advance. Every other mode defers to `advance_index` either way:
-/// `Context` wraps last→first, `Off` clamps to `None` at the end.
+/// - [`SuspendCause::AutoAdvance`] under `Track` resumes *the same track*: the
+///   context is repeating it and a queued song must not consume the repeat.
+///   [`advance_decision`] returns [`Decision::SuspendToQueue`] before it ever
+///   consults `repeat`, so this is the only thing keeping repeat-one alive
+///   across the queue.
+/// - [`SuspendCause::ManualSkip`] under `Track` advances — the user asked to
+///   move on — but clamps back onto the current track at the end of the context
+///   instead of tearing it down, matching the no-queue skip path, which leaves
+///   the last track repeating.
+///
+/// Every other mode defers to [`advance_index`]: `Context` wraps last→first (and
+/// never yields `None`), `Off` clamps to `None` at the end.
 #[allow(dead_code)]
 pub fn resume_index_after_queue(
   current: usize,
@@ -194,13 +203,15 @@ pub fn resume_index_after_queue(
   repeat: RepeatMode,
   cause: SuspendCause,
 ) -> Option<usize> {
-  match cause {
-    // Replay the repeated track. Guard `current < len` so an out-of-range index
-    // falls through to the clamping path instead of resuming a track that isn't
-    // there.
-    SuspendCause::AutoAdvance if repeat == RepeatMode::Track && current < len => Some(current),
-    _ => advance_index(current, len, repeat, true),
+  // Guard `current < len` so an out-of-range index falls through to
+  // `advance_index` rather than resuming a track that isn't there.
+  if repeat == RepeatMode::Track && current < len {
+    return match cause {
+      SuspendCause::AutoAdvance => Some(current),
+      SuspendCause::ManualSkip => advance_index(current, len, repeat, true).or(Some(current)),
+    };
   }
+  advance_index(current, len, repeat, true)
 }
 
 /// The index of the track after `current` in a queue of `len` tracks, clamped
@@ -533,9 +544,16 @@ mod tests {
     // repeat-one as a normal clamp/advance; this keeps the queue handoff in step
     // with them instead of resurrecting the skipped track once the queue drains.
     assert_eq!(resume_index_after_queue(5, 10, Track, ManualSkip), Some(6));
-    // At the boundary a manual skip clamps, exactly like `advance_index`.
-    assert_eq!(resume_index_after_queue(9, 10, Track, ManualSkip), None);
-    assert_eq!(resume_index_after_queue(0, 1, Track, ManualSkip), None);
+    // ...but at the end of the context it clamps back onto the current track
+    // rather than returning `None`. `None` here does not mean "clamp" as it does
+    // in `advance_index` — every resume path reads it as "context exhausted" and
+    // tears the context down, which under repeat-one would stop playback dead on
+    // a keypress that is a harmless no-op when the queue happens to be empty.
+    assert_eq!(resume_index_after_queue(9, 10, Track, ManualSkip), Some(9));
+    assert_eq!(resume_index_after_queue(0, 1, Track, ManualSkip), Some(0));
+    // Degenerate input still declines to resume a track that isn't there.
+    assert_eq!(resume_index_after_queue(0, 0, Track, ManualSkip), None);
+    assert_eq!(resume_index_after_queue(7, 3, Track, ManualSkip), None);
   }
 
   #[test]

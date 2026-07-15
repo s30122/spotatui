@@ -111,10 +111,23 @@ pub fn current_playback_snapshot(app: &App) -> Option<PlaybackSnapshot> {
   } else {
     context.map(|context| context.is_playing).unwrap_or(false)
   };
-  let shuffle = context
-    .map(|context| context.shuffle_state)
-    .unwrap_or(app.user_config.behavior.shuffle_enabled);
-  let repeat = context.map(|context| context.repeat_state);
+  // The native queue slot has no shuffle/repeat of its own: it plays an explicit
+  // list over a *suspended* context, and the playbar hides both indicators. A
+  // queued *decoded* track is blanked in `source_playback_snapshot`; a queued
+  // *Spotify* track reaches this path instead (a suspended Spotify context sets
+  // no `*_playback`), so blank it here too. Otherwise MPRIS would advertise — and
+  // let a client change — the suspended context's modes for a track the user has
+  // no shuffle/repeat control over, disagreeing with the keyboard, which no-ops.
+  let queue_owns_playback = app.queue_owns_playback();
+  let shuffle = !queue_owns_playback
+    && context
+      .map(|context| context.shuffle_state)
+      .unwrap_or(app.user_config.behavior.shuffle_enabled);
+  let repeat = if queue_owns_playback {
+    None
+  } else {
+    context.map(|context| context.repeat_state)
+  };
   let context_uri = context
     .and_then(|ctx| ctx.context.as_ref())
     .map(|context| context.uri.clone());
@@ -181,6 +194,16 @@ fn source_playback_snapshot(app: &App) -> Option<PlaybackSnapshot> {
     snapshot.shuffle = false;
     snapshot.repeat = None;
     return Some(snapshot);
+  }
+
+  // A queued *Spotify* track owns the sink (a decoded one returned above): every
+  // `*_playback` below is then a suspended context, not what is audible, so
+  // reporting one would publish the wrong track *and* its stale shuffle/repeat.
+  // Fall through to the Spotify snapshot, which describes the queued track and
+  // blanks the modes for a queue slot. Mirrors the same filter the runner applies
+  // to its dedicated local-playback path.
+  if app.queue_owns_playback() {
+    return None;
   }
 
   #[cfg(feature = "local-files")]

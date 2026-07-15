@@ -206,9 +206,12 @@ async fn replay_current(app: &Arc<Mutex<App>>) -> bool {
     None => false,
   };
   if replayed {
-    // Same track, same metadata: just clear the in-flight guard.
+    // Same track, same metadata: just clear the in-flight guard. The track did
+    // play, so forget earlier failures like any other successful play — a stale
+    // count would otherwise tear a later run down early.
     if let Some(local) = app.lock().await.local_playback.as_mut() {
       local.advancing = false;
+      local.failed_since_played.clear();
     }
   } else {
     if let Some(local) = app.lock().await.local_playback.take() {
@@ -320,6 +323,7 @@ async fn start_local_queue(app: &Arc<Mutex<App>>, queue: Vec<String>, start_idx:
         duration_ms: info.duration_ms,
         advancing: false,
         shuffle_backup: None,
+        failed_since_played: std::collections::HashSet::new(),
       };
       // Honor the player-global decoded shuffle for the freshly-built queue so it
       // persists across contexts like Spotify (the just-decoded start track stays
@@ -385,8 +389,7 @@ pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
     Ok(path) => path,
     Err(e) => {
       // Commit the index so the tick advances past this entry, then surface.
-      commit_index(app, target, None).await;
-      set_error(app, format!("Invalid local file URI: {e}")).await;
+      fail_index(app, target, format!("Invalid local file URI: {e}")).await;
       return;
     }
   };
@@ -403,7 +406,7 @@ pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
   match result {
     Ok(Ok(info)) => {
       let display_name = info.name.clone();
-      commit_index(app, target, Some(info)).await;
+      commit_index(app, target, info).await;
       app
         .lock()
         .await
@@ -416,8 +419,7 @@ pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
       // defense-in-depth: it is idempotent and guarantees no stale audio even if
       // the blocking closure failed *before* reaching `play_file`.
       player.stop();
-      commit_index(app, target, None).await;
-      set_error(app, format!("Cannot play local file: {e}")).await;
+      fail_index(app, target, format!("Cannot play local file: {e}")).await;
     }
     Err(e) => {
       // The blocking task panicked (e.g. inside the tag read) *before*
@@ -425,8 +427,7 @@ pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
       // Stop it explicitly so the empty sink lets the tick auto-advance instead
       // of dead-ending on a stale track with a silently moved index.
       player.stop();
-      commit_index(app, target, None).await;
-      set_error(app, format!("Local playback task failed: {e}")).await;
+      fail_index(app, target, format!("Local playback task failed: {e}")).await;
     }
   }
 }
@@ -435,21 +436,60 @@ pub(crate) async fn play_index(app: &Arc<Mutex<App>>, target: usize) {
 /// successful play, also refresh the displayed track metadata; on failure leave
 /// the previous metadata in place (the empty sink + moved index lets the tick
 /// carry on past the bad track).
+///
 async fn commit_index(
   app: &Arc<Mutex<App>>,
   target: usize,
-  info: Option<crate::core::plugin_api::TrackInfo>,
+  info: crate::core::plugin_api::TrackInfo,
 ) {
   let mut guard = app.lock().await;
   if let Some(local) = guard.local_playback.as_mut() {
     local.index = target;
     local.advancing = false;
-    if let Some(info) = info {
-      local.name = info.name;
-      local.artists = info.artists.join(", ");
-      local.album = info.album;
-      local.duration_ms = info.duration_ms;
+    local.failed_since_played.clear();
+    local.name = info.name;
+    local.artists = info.artists.join(", ");
+    local.album = info.album;
+    local.duration_ms = info.duration_ms;
+  }
+}
+
+/// Record a failed play of `target`: move the index on and clear the
+/// auto-advance guard so the tick carries past the bad track (the empty sink +
+/// moved index), leave the previous metadata in place, and surface `msg`.
+///
+/// Once *every* track in the queue has failed since the last successful play the
+/// session ends instead — see
+/// [`failed_since_played`](LocalPlaybackState::failed_since_played).
+///
+/// That teardown takes the session out under the **same lock** that observed the
+/// exhaustion, and leaves `advancing` latched rather than clearing it. Clearing
+/// the guard and releasing the lock first would leave a window where a runner
+/// tick sees a live session with an empty sink, decides `AdvanceContext`, and
+/// dispatches `NextTrack`; by the time that event is routed the session is gone,
+/// so it falls through to Spotify and skips a track on the user's real device.
+async fn fail_index(app: &Arc<Mutex<App>>, target: usize, msg: String) {
+  let exhausted = {
+    let mut guard = app.lock().await;
+    let Some(local) = guard.local_playback.as_mut() else {
+      return;
+    };
+    local.index = target;
+    local.failed_since_played.insert(target);
+    if local.failed_since_played.len() < local.queue.len() {
+      local.advancing = false;
+      None
+    } else {
+      guard.local_playback.take()
     }
+  };
+
+  match exhausted {
+    Some(local) => {
+      local.player.stop();
+      set_error(app, format!("{msg} — no playable tracks left, stopping")).await;
+    }
+    None => set_error(app, msg).await,
   }
 }
 
