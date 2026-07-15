@@ -3538,11 +3538,23 @@ impl App {
   /// runner tick leaves it alone. Radio is torn down (a live stream can't share
   /// the sink) and its station stashed for reconnect. A no-op when no decoded
   /// context is active. Called before handing the sink to the native queue.
-  pub(crate) fn suspend_active_decoded_context_for_skip(&mut self) {
-    // Under Repeat All the context wraps at its end (last -> first), so a skip
-    // at the final track resumes the first one after the queue drains rather
-    // than reading as exhausted (`None`). `advance_index` applies exactly that
-    // per-mode wrap/clamp; `Off`/`Track` still clamp to `None` at the boundary.
+  ///
+  /// `cause` decides where the context resumes under Repeat One: an auto-advance
+  /// handoff replays the repeated track, a manual Next advances past it. See
+  /// [`crate::infra::queue::resume_index_after_queue`].
+  pub(crate) fn suspend_active_decoded_context_for_skip(
+    &mut self,
+    #[cfg_attr(
+      not(any(feature = "local-files", feature = "subsonic", feature = "youtube")),
+      allow(unused_variables)
+    )]
+    cause: crate::infra::queue::SuspendCause,
+  ) {
+    // `resume_index_after_queue` applies the per-mode wrap/clamp: Repeat All
+    // wraps at the end (last -> first) so a skip at the final track resumes the
+    // first one rather than reading as exhausted (`None`); Repeat One resumes
+    // the *same* track on an auto-advance (a queued song must not consume the
+    // repeat) but advances on a manual skip; Off clamps to `None` at the boundary.
     #[cfg_attr(
       not(any(feature = "local-files", feature = "subsonic", feature = "youtube")),
       allow(unused_variables)
@@ -3550,8 +3562,12 @@ impl App {
     let repeat = self.decoded_repeat;
     #[cfg(feature = "local-files")]
     if let Some(local) = self.local_playback.as_mut() {
-      let resume_index =
-        crate::infra::queue::advance_index(local.index, local.queue.len(), repeat, true);
+      let resume_index = crate::infra::queue::resume_index_after_queue(
+        local.index,
+        local.queue.len(),
+        repeat,
+        cause,
+      );
       local.advancing = true;
       self.queue_suspended = Some(crate::core::queue::SuspendedContext::Local {
         resume_index,
@@ -3561,7 +3577,8 @@ impl App {
     }
     #[cfg(feature = "subsonic")]
     if let Some(s) = self.subsonic_playback.as_mut() {
-      let resume_index = crate::infra::queue::advance_index(s.index, s.tracks.len(), repeat, true);
+      let resume_index =
+        crate::infra::queue::resume_index_after_queue(s.index, s.tracks.len(), repeat, cause);
       s.advancing = true;
       self.queue_suspended = Some(crate::core::queue::SuspendedContext::Subsonic {
         resume_index,
@@ -3571,7 +3588,8 @@ impl App {
     }
     #[cfg(feature = "youtube")]
     if let Some(s) = self.youtube_playback.as_mut() {
-      let resume_index = crate::infra::queue::advance_index(s.index, s.tracks.len(), repeat, true);
+      let resume_index =
+        crate::infra::queue::resume_index_after_queue(s.index, s.tracks.len(), repeat, cause);
       s.advancing = true;
       self.queue_suspended = Some(crate::core::queue::SuspendedContext::YouTube {
         resume_index,
@@ -4357,8 +4375,10 @@ impl App {
     }
     // A decoded context is playing with items waiting in the queue: suspend it
     // (skip semantics — resume at the context's next track) and start the queue.
+    // An explicit Next advances the context even under Repeat One, matching the
+    // per-source skip paths: repeat-one only replays on *auto* advance.
     if self.active_decoded_source() && !self.native_queue.is_empty() {
-      self.suspend_active_decoded_context_for_skip();
+      self.suspend_active_decoded_context_for_skip(crate::infra::queue::SuspendCause::ManualSkip);
       self.song_progress_ms = 0;
       self.dispatch(IoEvent::AdvanceNativeQueue);
       return;

@@ -1023,7 +1023,11 @@ pub async fn start_ui(
                   });
                 }
                 Some(Decision::SuspendToQueue) => {
-                  $app.suspend_active_decoded_context_for_skip();
+                  // End-of-track handoff: under Repeat One the context resumes
+                  // the same track, so a queued song can't consume the repeat.
+                  $app.suspend_active_decoded_context_for_skip(
+                    crate::infra::queue::SuspendCause::AutoAdvance,
+                  );
                   $app.dispatch(crate::infra::network::IoEvent::AdvanceNativeQueue);
                 }
                 Some(Decision::Teardown) => $app.$playback = None,
