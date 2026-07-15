@@ -967,7 +967,7 @@ pub async fn start_ui(
         // Native queue slot: when the queued track finishes, advance the queue
         // (play the next queued item, or resume the suspended context). Runs
         // before the per-source blocks so it takes precedence over them.
-        #[cfg(feature = "audio-decode")]
+        #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
         {
           use crate::infra::queue::QueueNowPlaying;
           let advance = match app.queue_now.as_mut() {
@@ -1023,7 +1023,11 @@ pub async fn start_ui(
                   });
                 }
                 Some(Decision::SuspendToQueue) => {
-                  $app.suspend_active_decoded_context_for_skip();
+                  // End-of-track handoff: under Repeat One the context resumes
+                  // the same track, so a queued song can't consume the repeat.
+                  $app.suspend_active_decoded_context_for_skip(
+                    crate::infra::queue::SuspendCause::AutoAdvance,
+                  );
                   $app.dispatch(crate::infra::network::IoEvent::AdvanceNativeQueue);
                 }
                 Some(Decision::Teardown) => $app.$playback = None,
@@ -1073,7 +1077,7 @@ pub async fn start_ui(
         // The native queue slot owns the sink when playing a decoded track; read
         // progress from its player first (it may share the suspended context's
         // player, in which case a per-source block below reads the same value).
-        #[cfg(feature = "audio-decode")]
+        #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
         if let Some(crate::infra::queue::QueueNowPlaying::Decoded(d)) = app.queue_now.as_ref() {
           source_owns_playback = true;
           app.song_progress_ms = d.player.position().as_millis();

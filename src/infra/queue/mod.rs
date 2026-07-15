@@ -155,6 +155,54 @@ pub fn advance_index(
   }
 }
 
+/// Why a decoded context was handed off to the native queue, which is what
+/// decides where it resumes once the queue drains.
+///
+/// The distinction only matters under [`RepeatMode::Track`], where the repo-wide
+/// rule is that repeat-one affects *auto* advance but not a *manual* skip (see
+/// [`advance_index`]). Both handoffs otherwise resume the context's next track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SuspendCause {
+  /// The context's track ended on its own and the queue preempted the context's
+  /// own advance.
+  AutoAdvance,
+  /// The user pressed Next while items were waiting in the queue.
+  ManualSkip,
+}
+
+/// The index a decoded context should resume at once the native queue drains,
+/// having been suspended with skip semantics (resume at position 0).
+///
+/// Differs from [`advance_index`] in exactly one case: an [`SuspendCause::AutoAdvance`]
+/// handoff under [`RepeatMode::Track`] resumes *the same track*, because the
+/// context is repeating it and a queued song must not consume the repeat.
+/// [`advance_decision`] returns [`Decision::SuspendToQueue`] before it ever
+/// consults `repeat`, so this is the only thing keeping repeat-one alive across
+/// the queue: without it the repeated track is skipped, and on the last track
+/// `advance_index` returns `None`, which reads as "context exhausted" and tears
+/// the whole context down.
+///
+/// A [`SuspendCause::ManualSkip`] handoff advances even under repeat-one — the
+/// user asked to move on, and the per-source skip paths treat repeat-one as a
+/// normal clamp/advance. Every other mode defers to `advance_index` either way:
+/// `Context` wraps last→first, `Off` clamps to `None` at the end.
+#[allow(dead_code)]
+pub fn resume_index_after_queue(
+  current: usize,
+  len: usize,
+  repeat: RepeatMode,
+  cause: SuspendCause,
+) -> Option<usize> {
+  match cause {
+    // Replay the repeated track. Guard `current < len` so an out-of-range index
+    // falls through to the clamping path instead of resuming a track that isn't
+    // there.
+    SuspendCause::AutoAdvance if repeat == RepeatMode::Track && current < len => Some(current),
+    _ => advance_index(current, len, repeat, true),
+  }
+}
+
 /// The index of the track after `current` in a queue of `len` tracks, clamped
 /// at the end: [`advance_index`] under [`RepeatMode::Off`], going forward.
 ///
@@ -276,7 +324,11 @@ fn restore_in_place<T>(items: &mut Vec<T>, backup: &ShuffleBackup, current: usiz
 /// Returns whether playback restarted. On `false` the caller must tear its
 /// session down — an empty sink left in place would read as end-of-track and
 /// re-fire replay every runner tick.
-#[cfg(feature = "audio-decode")]
+///
+/// Gated on the *queueable* decoded sources rather than `audio-decode`: replay
+/// is the repeat-one path of a finite track list. Internet radio decodes audio
+/// too, but a live stream has no track to re-decode.
+#[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
 pub async fn replay_file(
   player: std::sync::Arc<crate::infra::audio::LocalPlayer>,
   path: std::path::PathBuf,
@@ -290,7 +342,12 @@ pub async fn replay_file(
 /// A queued *decoded* track playing through the shared [`LocalPlayer`] sink
 /// (local file, Subsonic, or YouTube). Kept separate from the per-source
 /// `*_playback` structs so the underlying context is preserved for resume.
-#[cfg(feature = "audio-decode")]
+///
+/// Gated on exactly those three sources, not `audio-decode`: they are the ones
+/// [`dispatch::try_play_queued`] can play. Internet radio pulls `audio-decode`
+/// in as well, but a live stream is never a queue item, so a radio-only build
+/// can never construct this.
+#[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
 pub struct DecodedQueuePlayback {
   /// The output-device sink. Shared (`Arc::ptr_eq`) with the suspended context's
   /// player when there is one, so no second device is opened.
@@ -320,13 +377,21 @@ pub struct DecodedQueuePlayback {
 
 /// What the native queue's playback slot is currently playing.
 ///
-/// A slim build (neither native streaming nor a decoded source) cannot play a
-/// queued track at all, so this type is gated to builds that can; the
-/// `App::queue_now` field shares that gate, and every call site goes through the
-/// unconditional `App::queue_owns_playback()` accessor.
-#[cfg(any(feature = "streaming", feature = "audio-decode"))]
+/// A build with no *queueable* source (neither native streaming nor a decoded
+/// source that owns a finite track list) cannot play a queued track at all, so
+/// this type is gated to builds that can; the `App::queue_now` field shares that
+/// gate, and every call site goes through the unconditional
+/// `App::queue_owns_playback()` accessor. Note internet radio is deliberately
+/// absent from both halves of the gate: it decodes audio, but a `radio:` URI is
+/// never a queue item, so it can neither fill nor own this slot.
+#[cfg(any(
+  feature = "streaming",
+  feature = "local-files",
+  feature = "subsonic",
+  feature = "youtube"
+))]
 pub enum QueueNowPlaying {
-  #[cfg(feature = "audio-decode")]
+  #[cfg(any(feature = "local-files", feature = "subsonic", feature = "youtube"))]
   Decoded(DecodedQueuePlayback),
   /// A Spotify track playing via native streaming (`player.load`, no Spirc
   /// context).
@@ -437,6 +502,56 @@ mod tests {
     assert_eq!(advance_index(0, 1, Context, true), Some(0));
     assert_eq!(advance_index(0, 1, Context, false), Some(0));
     assert_eq!(advance_index(0, 0, Context, true), None);
+  }
+
+  #[test]
+  fn auto_advance_handoff_replays_the_repeat_one_track() {
+    use RepeatMode::Track;
+    use SuspendCause::AutoAdvance;
+    // Regression: a queued song preempts playback via `Decision::SuspendToQueue`
+    // *before* `advance_decision` consults `repeat`, so the resume index is the
+    // only thing keeping Repeat One alive across the queue. It must replay the
+    // same track, not advance past it.
+    assert_eq!(resume_index_after_queue(5, 10, Track, AutoAdvance), Some(5));
+    // The boundary case that used to lose the context entirely: on the last
+    // track, advancing would yield `None` and tear the whole context down.
+    assert_eq!(resume_index_after_queue(9, 10, Track, AutoAdvance), Some(9));
+    // Single-track context repeats itself.
+    assert_eq!(resume_index_after_queue(0, 1, Track, AutoAdvance), Some(0));
+    // Degenerate input still clamps rather than resuming a track that isn't there.
+    assert_eq!(resume_index_after_queue(0, 0, Track, AutoAdvance), None);
+    assert_eq!(resume_index_after_queue(7, 3, Track, AutoAdvance), None);
+  }
+
+  #[test]
+  fn manual_skip_handoff_advances_even_under_repeat_one() {
+    use RepeatMode::Track;
+    use SuspendCause::ManualSkip;
+    // Repeat-one only replays on *auto* advance: an explicit Next moves on, so
+    // the suspended context must not resume the track the user just skipped.
+    // The per-source skip paths (local/subsonic/youtube dispatch) already treat
+    // repeat-one as a normal clamp/advance; this keeps the queue handoff in step
+    // with them instead of resurrecting the skipped track once the queue drains.
+    assert_eq!(resume_index_after_queue(5, 10, Track, ManualSkip), Some(6));
+    // At the boundary a manual skip clamps, exactly like `advance_index`.
+    assert_eq!(resume_index_after_queue(9, 10, Track, ManualSkip), None);
+    assert_eq!(resume_index_after_queue(0, 1, Track, ManualSkip), None);
+  }
+
+  #[test]
+  fn resume_after_queue_matches_advance_for_the_other_modes() {
+    use RepeatMode::{Context, Off};
+    // Outside repeat-one the cause makes no difference: both handoffs advance.
+    for cause in [SuspendCause::AutoAdvance, SuspendCause::ManualSkip] {
+      // Repeat All still wraps last -> first, so the context resumes rather than
+      // reading as exhausted.
+      assert_eq!(resume_index_after_queue(2, 3, Context, cause), Some(0));
+      assert_eq!(resume_index_after_queue(0, 3, Context, cause), Some(1));
+      // Off advances, and clamps to None at the end (context exhausted -> teardown).
+      assert_eq!(resume_index_after_queue(0, 3, Off, cause), Some(1));
+      assert_eq!(resume_index_after_queue(2, 3, Off, cause), None);
+      assert_eq!(resume_index_after_queue(0, 0, Off, cause), None);
+    }
   }
 
   #[test]
