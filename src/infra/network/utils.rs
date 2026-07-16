@@ -88,6 +88,7 @@ impl UtilsNetwork for Network {
       }
       app.lyrics_status = LyricsStatus::Loading;
       app.lyrics = None;
+      app.lyrics_synced = false;
     }
 
     match client

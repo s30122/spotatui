@@ -155,7 +155,10 @@ pub fn get_help_docs(app: &App) -> Vec<Vec<String>> {
     ],
     vec![
       String::from("Scroll lyrics (pauses auto-follow)"),
-      String::from("<Up>/<Down>"),
+      format!(
+        "{}/{} | <Up>/<Down> | <Ctrl+p>/<Ctrl+n>",
+        key_bindings.move_up, key_bindings.move_down
+      ),
       String::from("Lyrics view"),
     ],
     vec![
@@ -165,7 +168,10 @@ pub fn get_help_docs(app: &App) -> Vec<Vec<String>> {
     ],
     vec![
       String::from("Nudge lyric timing earlier/later"),
-      String::from("<Right>/<Left>"),
+      format!(
+        "{}/{} | <Right>/<Left> | <Ctrl+f>/<Ctrl+b>",
+        key_bindings.move_right, key_bindings.move_left
+      ),
       String::from("Lyrics view"),
     ],
     vec![

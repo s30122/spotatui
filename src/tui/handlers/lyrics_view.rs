@@ -5,9 +5,6 @@ use std::time::Instant;
 
 pub fn handler(key: Key, app: &mut App) {
   match key {
-    Key::Char('s') => {
-      super::playbar::toggle_like_currently_playing_item(app);
-    }
     Key::Char('f') => {
       app.lyrics_view.manual_index = None;
     }
