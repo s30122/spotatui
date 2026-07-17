@@ -45,6 +45,11 @@ pub(crate) fn handle_control(control: PlaybarControl, app: &mut App) {
 }
 
 pub(crate) fn toggle_like_currently_playing_item(app: &mut App) {
+  if spotify_context_is_suspended(app.queue_owns_playback(), app.active_decoded_source()) {
+    app.set_status_message("The current playback source cannot be liked", 4);
+    return;
+  }
+
   if let Some(CurrentPlaybackContext {
     item: Some(item), ..
   }) = app.current_playback_context.to_owned()
@@ -61,6 +66,10 @@ pub(crate) fn toggle_like_currently_playing_item(app: &mut App) {
       _ => {}
     };
   };
+}
+
+fn spotify_context_is_suspended(queue_owns_playback: bool, decoded_source_active: bool) -> bool {
+  queue_owns_playback || decoded_source_active
 }
 
 pub(crate) fn add_currently_playing_track_to_playlist(app: &mut App) {
@@ -109,5 +118,12 @@ mod tests {
       app.status_message.as_deref(),
       Some("No track currently playing")
     );
+  }
+
+  #[test]
+  fn non_spotify_playback_cannot_use_cached_spotify_item_for_like() {
+    assert!(spotify_context_is_suspended(false, true));
+    assert!(spotify_context_is_suspended(true, false));
+    assert!(!spotify_context_is_suspended(false, false));
   }
 }
