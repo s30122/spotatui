@@ -307,7 +307,8 @@ async fn handle_player_events(
 
           app.instant_since_last_current_playback_poll = std::time::Instant::now();
 
-          let track_id_str = track_id.to_string();
+          let track_id_uri = track_id.to_string();
+          let track_id_str = app::base62_id_of(&track_id_uri).to_string();
           if app.last_track_id.as_ref() != Some(&track_id_str) {
             app.last_track_id = Some(track_id_str);
             app.dispatch(IoEvent::GetCurrentPlayback);
@@ -454,7 +455,11 @@ async fn handle_player_events(
         });
 
         app.song_progress_ms = 0;
-        let playing_id = audio_item.track_id.to_string();
+        // librespot 0.8's `SpotifyUri` Display is the full `spotify:track:<id>`
+        // URI; app-side ids (shuffle index sync, the queue guard,
+        // `last_track_id`) are bare base62, so normalize at the event boundary.
+        let playing_uri = audio_item.track_id.to_string();
+        let playing_id = app::base62_id_of(&playing_uri).to_string();
         app.last_track_id = Some(playing_id.clone());
         // Keep the client-side shuffle session pointed at what Spirc actually
         // plays (also detects a completed repeat-all lap for the reshuffle).
@@ -551,7 +556,10 @@ async fn handle_player_events(
             // hands off to the queue. Only when neither applies do we fall back
             // to the normal continue-playback path.
             if !app.handle_native_spotify_track_end() {
-              app.dispatch(IoEvent::EnsurePlaybackContinues(track_id.to_string()));
+              let ended_uri = track_id.to_string();
+              app.dispatch(IoEvent::EnsurePlaybackContinues(
+                app::base62_id_of(&ended_uri).to_string(),
+              ));
             }
           }
         }
@@ -759,6 +767,10 @@ async fn disconnect_streaming_player(
   app_lock.native_is_playing = Some(false);
   app_lock.native_track_info = None;
   app_lock.native_playback_origin = None;
+  // Clearing the session below bumps its generation, which would turn a
+  // shuffled queue suspension into a silent no-op at resume time; convert it
+  // to a context snapshot first (while the cached context is still around).
+  app_lock.convert_shuffled_suspension_to_context(None);
   app_lock.clear_native_shuffle_session();
   app_lock.song_progress_ms = 0;
   app_lock.last_track_id = None;

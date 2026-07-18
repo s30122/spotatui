@@ -888,6 +888,10 @@ pub struct NativeSpotifyShuffleSession {
   pub shuffled: bool,
   /// False while the background full-context fetch is still running.
   pub fetch_complete: bool,
+  /// The background full-context fetch failed for good (retries exhausted):
+  /// `order` never grew past its seed and the queue-suspend path must fall
+  /// back to the context route instead of a shuffled resume.
+  pub fetch_failed: bool,
   /// Stamp guarding stale background fetches from writing into a newer session.
   pub generation: u64,
   /// Set to the index we just loaded into Spirc whenever the session issues a
@@ -903,11 +907,26 @@ pub struct NativeSpotifyShuffleSession {
   pub pending_manual_skip: Option<bool>,
 }
 
-/// Whether a `spotify:track:<id>` URI refers to librespot's base62 track id
-/// (the form `PlayerEvent::TrackChanged` reports).
+/// The bare base62 id of a `spotify:<kind>:<id>` URI. librespot 0.8's
+/// `SpotifyUri` Display prints the full URI while every app-side comparison
+/// uses the bare id, so player-event handlers normalize through this once at
+/// the event boundary. Anything else passes through unchanged: a bare id, and
+/// notably `spotify:local:<artist>:<album>:<title>:<duration>` URIs, whose
+/// only unique identity is the full string (the last segment is a duration
+/// shared across unrelated local tracks).
+#[cfg_attr(not(feature = "streaming"), allow(dead_code))]
+pub(crate) fn base62_id_of(uri_or_id: &str) -> &str {
+  let mut parts = uri_or_id.split(':');
+  match (parts.next(), parts.next(), parts.next(), parts.next()) {
+    (Some("spotify"), Some(kind), Some(id), None) if kind != "local" => id,
+    _ => uri_or_id,
+  }
+}
+
+/// Whether a `spotify:track:<id>` URI refers to the given bare base62 track id.
 #[cfg_attr(not(feature = "streaming"), allow(dead_code))]
 pub(crate) fn uri_matches_base62_id(uri: &str, base62_id: &str) -> bool {
-  uri.rsplit(':').next() == Some(base62_id)
+  base62_id_of(uri) == base62_id
 }
 
 /// How playback moved to the track a `TrackChanged` reports, so the wrap-search
@@ -2475,6 +2494,10 @@ impl App {
       // doesn't linger as a ghost Connect device (#297).
       player.shutdown();
     }
+    // Unlike disconnect recovery, the shuffle session (and any shuffled queue
+    // suspension bound to its generation) is deliberately kept: the session is
+    // app-owned and player-independent, so a session-driven load resumes it on
+    // the replacement player.
     self.is_streaming_active = false;
     self.native_activation_pending = false;
     self.native_device_id = None;
@@ -3962,19 +3985,46 @@ impl App {
     // (no context reload, no reshuffle) — the whole point of the session is
     // that a queue interruption cannot regenerate the remaining shuffle order.
     if let Some(session) = self.native_spotify_shuffle.as_ref() {
-      let generation = session.generation;
-      let resume_index = crate::infra::queue::resume_index_after_queue(
-        session.index,
-        session.order.len(),
-        self.native_shuffle_repeat_mode(),
-        cause,
-      );
-      self.queue_suspended = Some(crate::core::queue::SuspendedContext::SpotifyShuffled {
-        resume_index,
-        generation,
-      });
-      return;
+      // A lazily-seeded session whose context fetch failed for good has only
+      // its seed track — a shuffled resume would dead-end in "Queue finished",
+      // so fall through and snapshot the Spotify context instead.
+      if !(session.fetch_failed && session.order.len() <= 1) {
+        let generation = session.generation;
+        let resume_index = crate::infra::queue::resume_index_after_queue(
+          session.index,
+          session.order.len(),
+          self.native_shuffle_repeat_mode(),
+          cause,
+        );
+        let (context_uri, resume_track_uri) = self.spotify_context_snapshot_parts();
+        self.queue_suspended = Some(crate::core::queue::SuspendedContext::SpotifyShuffled {
+          resume_index,
+          generation,
+          context_uri,
+          resume_track_uri,
+        });
+        return;
+      }
     }
+    self.queue_suspended = Some(self.spotify_context_suspend_snapshot());
+  }
+
+  /// Snapshot the current Spotify context as a queue suspension: the resume
+  /// target is the mirror queue's head (the context's next track). Used by the
+  /// suspend fall-through above.
+  #[cfg(feature = "streaming")]
+  pub(crate) fn spotify_context_suspend_snapshot(&self) -> crate::core::queue::SuspendedContext {
+    let (context_uri, resume_track_uri) = self.spotify_context_snapshot_parts();
+    crate::core::queue::SuspendedContext::Spotify {
+      context_uri,
+      resume_track_uri,
+    }
+  }
+
+  /// The live context snapshot pieces: the playing context's uri and the
+  /// Spotify mirror queue's head (the context's next track).
+  #[cfg(feature = "streaming")]
+  fn spotify_context_snapshot_parts(&self) -> (Option<String>, Option<String>) {
     let context_uri = self
       .current_playback_context
       .as_ref()
@@ -3988,9 +4038,37 @@ impl App {
         crate::core::plugin_api::PlayableInfo::Track(t) => t.uri.clone(),
         crate::core::plugin_api::PlayableInfo::Episode(e) => e.uri.clone(),
       });
-    self.queue_suspended = Some(crate::core::queue::SuspendedContext::Spotify {
+    (context_uri, resume_track_uri)
+  }
+
+  /// Convert a shuffled queue suspension into a context snapshot. Called when
+  /// the shuffle session it indexes into is invalidated while suspended
+  /// (disconnect recovery, failed context fetch): the shuffled resume would be
+  /// a silent no-op and the queued tracks would drain into nothing. Prefers
+  /// the context captured at suspension time — by conversion time
+  /// `current_playback_context` may describe the queued track, not the
+  /// suspended context — and falls back to the live snapshot per field.
+  /// `only_generation` restricts the conversion to a suspension bound to that
+  /// session generation.
+  #[cfg(feature = "streaming")]
+  pub(crate) fn convert_shuffled_suspension_to_context(&mut self, only_generation: Option<u64>) {
+    let Some(crate::core::queue::SuspendedContext::SpotifyShuffled {
+      generation,
       context_uri,
       resume_track_uri,
+      ..
+    }) = &self.queue_suspended
+    else {
+      return;
+    };
+    if only_generation.is_some_and(|g| *generation != g) {
+      return;
+    }
+    let stored = (context_uri.clone(), resume_track_uri.clone());
+    let live = self.spotify_context_snapshot_parts();
+    self.queue_suspended = Some(crate::core::queue::SuspendedContext::Spotify {
+      context_uri: stored.0.or(live.0),
+      resume_track_uri: stored.1.or(live.1),
     });
   }
 
@@ -4008,20 +4086,28 @@ impl App {
     // Mid-track semantics for a client-side shuffle session: resume the track
     // that was playing, at its position in the app-owned order.
     if let Some(session) = self.native_spotify_shuffle.as_ref() {
-      let generation = session.generation;
-      let resume_index = if session.index < session.order.len() {
-        Some(session.index)
-      } else {
-        None
-      };
-      self.queue_suspended = Some(crate::core::queue::SuspendedContext::SpotifyShuffled {
-        resume_index,
-        generation,
-      });
-      if let Some(player) = self.streaming_player.as_ref() {
-        player.pause();
+      // Same stranded-session fallback as the queue suspend: a seed-only
+      // session with a failed fetch would replay the seed and then dead-end,
+      // so fall through and resume through the context route instead.
+      if !(session.fetch_failed && session.order.len() <= 1) {
+        let generation = session.generation;
+        let resume_index = if session.index < session.order.len() {
+          Some(session.index)
+        } else {
+          None
+        };
+        let (context_uri, resume_track_uri) = self.spotify_context_snapshot_parts();
+        self.queue_suspended = Some(crate::core::queue::SuspendedContext::SpotifyShuffled {
+          resume_index,
+          generation,
+          context_uri,
+          resume_track_uri,
+        });
+        if let Some(player) = self.streaming_player.as_ref() {
+          player.pause();
+        }
+        return;
       }
-      return;
     }
     let context_uri = self
       .current_playback_context
@@ -4257,7 +4343,7 @@ impl App {
       QueueNowPlaying::Decoded(_) => return None,
       QueueNowPlaying::Spotify { track } => track.uri.clone(),
     }?;
-    let queued_id = queued_uri.rsplit(':').next().unwrap_or(queued_uri.as_str());
+    let queued_id = base62_id_of(&queued_uri);
     if queued_id == playing_base62_id {
       // The queued track is (re)confirmed playing: clear the retry budget.
       self.spotify_queue_guard_reloads = 0;
@@ -7844,6 +7930,7 @@ mod tests {
       index: 1,
       shuffled: true,
       fetch_complete: true,
+      fetch_failed: false,
       generation: 42,
       pending_reload_index: None,
       pending_manual_skip: None,
@@ -7856,6 +7943,7 @@ mod tests {
       Some(SuspendedContext::SpotifyShuffled {
         resume_index,
         generation,
+        ..
       }) => {
         assert_eq!(
           resume_index,
@@ -7880,6 +7968,246 @@ mod tests {
       }
       other => panic!("expected a shuffled suspension, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn base62_id_of_strips_the_uri_prefix() {
+    assert_eq!(
+      base62_id_of("spotify:track:6q02DsdnysAHuwmxFuI20c"),
+      "6q02DsdnysAHuwmxFuI20c"
+    );
+    assert_eq!(base62_id_of("spotify:episode:abc"), "abc");
+    // A bare id passes through unchanged.
+    assert_eq!(
+      base62_id_of("6q02DsdnysAHuwmxFuI20c"),
+      "6q02DsdnysAHuwmxFuI20c"
+    );
+    // A Spotify local-track URI's only unique identity is the full string;
+    // stripping to the last segment would collide tracks by duration.
+    assert_eq!(
+      base62_id_of("spotify:local:Artist:Album:Title:213"),
+      "spotify:local:Artist:Album:Title:213"
+    );
+  }
+
+  /// Regression for the frozen shuffle index: librespot 0.8's `TrackChanged`
+  /// reports the full `spotify:track:<id>` URI, and feeding that through
+  /// unnormalized made every order lookup miss, so `session.index` stayed at 0
+  /// for the whole session. The event boundary now normalizes to the bare id;
+  /// an auto advance must move the index to the playing track.
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn sync_native_shuffle_index_advances_on_auto_track_changed() {
+    let (tx, _rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
+      order: vec![
+        "spotify:track:a".to_string(),
+        "spotify:track:b".to_string(),
+        "spotify:track:c".to_string(),
+      ],
+      original: Vec::new(),
+      index: 0,
+      shuffled: true,
+      fetch_complete: true,
+      fetch_failed: false,
+      generation: 1,
+      pending_reload_index: None,
+      pending_manual_skip: None,
+    });
+
+    // What the event boundary hands over for librespot's full-URI form.
+    let playing_uri = "spotify:track:b".to_string();
+    app.sync_native_shuffle_index(base62_id_of(&playing_uri));
+
+    assert_eq!(app.native_spotify_shuffle.as_ref().unwrap().index, 1);
+  }
+
+  /// Queue resume targets the track *after* the one that was playing: with the
+  /// index synced to 2, an auto-advance suspend under repeat Off stores resume
+  /// index 3. (The frozen index always produced 1, replaying or rewinding to
+  /// the second shuffled track after every queue drain.)
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn queue_resume_targets_the_track_after_the_synced_index() {
+    use crate::core::queue::SuspendedContext;
+    let (tx, _rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
+      order: vec![
+        "spotify:track:a".to_string(),
+        "spotify:track:b".to_string(),
+        "spotify:track:c".to_string(),
+        "spotify:track:d".to_string(),
+      ],
+      original: Vec::new(),
+      index: 0,
+      shuffled: true,
+      fetch_complete: true,
+      fetch_failed: false,
+      generation: 7,
+      pending_reload_index: None,
+      pending_manual_skip: None,
+    });
+
+    let playing_uri = "spotify:track:c".to_string();
+    app.sync_native_shuffle_index(base62_id_of(&playing_uri));
+    app.suspend_native_spotify_context_for_queue(crate::infra::queue::SuspendCause::AutoAdvance);
+
+    match app.queue_suspended {
+      Some(SuspendedContext::SpotifyShuffled { resume_index, .. }) => {
+        assert_eq!(resume_index, Some(3));
+      }
+      other => panic!("expected a shuffled suspension, got {other:?}"),
+    }
+  }
+
+  /// A playlist shuffle session whose background context fetch failed for good
+  /// is stuck on its seed track. Suspending for the queue must snapshot the
+  /// Spotify context (resumable through the context route) instead of storing
+  /// a shuffled resume that dead-ends in "Queue finished".
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn stranded_seed_only_shuffle_session_suspends_to_the_context() {
+    use crate::core::queue::SuspendedContext;
+    let (tx, _rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    app.current_playback_context = Some(context_playing("spotify:playlist:ctx"));
+    app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
+      order: vec!["spotify:track:seed".to_string()],
+      original: vec!["spotify:track:seed".to_string()],
+      index: 0,
+      shuffled: true,
+      fetch_complete: true,
+      fetch_failed: true,
+      generation: 1,
+      pending_reload_index: None,
+      pending_manual_skip: None,
+    });
+
+    app.suspend_native_spotify_context_for_queue(crate::infra::queue::SuspendCause::AutoAdvance);
+
+    match app.queue_suspended {
+      Some(SuspendedContext::Spotify { context_uri, .. }) => {
+        assert_eq!(context_uri.as_deref(), Some("spotify:playlist:ctx"));
+      }
+      other => panic!("expected a context suspension, got {other:?}"),
+    }
+  }
+
+  /// A genuinely one-track context (fetch succeeded, nothing more to play)
+  /// still suspends as a shuffled session: its `None` resume correctly means
+  /// "context exhausted" rather than a stranded fetch.
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn exhausted_one_track_shuffle_session_still_suspends_shuffled() {
+    use crate::core::queue::SuspendedContext;
+    let (tx, _rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
+      order: vec!["spotify:track:only".to_string()],
+      original: vec!["spotify:track:only".to_string()],
+      index: 0,
+      shuffled: true,
+      fetch_complete: true,
+      fetch_failed: false,
+      generation: 2,
+      pending_reload_index: None,
+      pending_manual_skip: None,
+    });
+
+    app.suspend_native_spotify_context_for_queue(crate::infra::queue::SuspendCause::AutoAdvance);
+
+    match app.queue_suspended {
+      Some(SuspendedContext::SpotifyShuffled { resume_index, .. }) => {
+        assert_eq!(resume_index, None, "one-track context is exhausted");
+      }
+      other => panic!("expected a shuffled suspension, got {other:?}"),
+    }
+  }
+
+  /// Disconnect recovery clears the shuffle session, which orphans a shuffled
+  /// queue suspension (the generation check turns the resume into a silent
+  /// no-op and the queued tracks vanish). Converting it to a context snapshot
+  /// first keeps the drain resumable through the context route.
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn shuffled_suspension_converts_to_context_when_session_is_cleared() {
+    use crate::core::queue::SuspendedContext;
+    let (tx, _rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    app.current_playback_context = Some(context_playing("spotify:playlist:ctx"));
+    app.native_spotify_shuffle = Some(NativeSpotifyShuffleSession {
+      order: vec!["spotify:track:a".to_string(), "spotify:track:b".to_string()],
+      original: Vec::new(),
+      index: 0,
+      shuffled: true,
+      fetch_complete: true,
+      fetch_failed: false,
+      generation: 5,
+      pending_reload_index: None,
+      pending_manual_skip: None,
+    });
+    // The suspension carries the context captured when it was created; by
+    // disconnect time the live context may describe the queued track instead.
+    app.queue_suspended = Some(SuspendedContext::SpotifyShuffled {
+      resume_index: Some(1),
+      generation: 5,
+      context_uri: Some("spotify:playlist:captured".to_string()),
+      resume_track_uri: None,
+    });
+
+    // What disconnect recovery does, in order.
+    app.convert_shuffled_suspension_to_context(None);
+    app.clear_native_shuffle_session();
+
+    match app.queue_suspended.take() {
+      Some(SuspendedContext::Spotify { context_uri, .. }) => {
+        assert_eq!(
+          context_uri.as_deref(),
+          Some("spotify:playlist:captured"),
+          "the suspension-time context wins over the live one"
+        );
+      }
+      other => panic!("expected a context suspension, got {other:?}"),
+    }
+
+    // Without a captured context the conversion falls back to the live one.
+    app.queue_suspended = Some(SuspendedContext::SpotifyShuffled {
+      resume_index: Some(1),
+      generation: 6,
+      context_uri: None,
+      resume_track_uri: None,
+    });
+    app.convert_shuffled_suspension_to_context(None);
+    match app.queue_suspended {
+      Some(SuspendedContext::Spotify { context_uri, .. }) => {
+        assert_eq!(context_uri.as_deref(), Some("spotify:playlist:ctx"));
+      }
+      other => panic!("expected a context suspension, got {other:?}"),
+    }
+  }
+
+  /// The Spirc self-advance guard compares bare ids: the queued track's own
+  /// `TrackChanged` (normalized at the event boundary) reads as confirmation,
+  /// not as Spirc fighting back. (Comparing against the full URI reissued every
+  /// queued track up to the retry budget, restarting it from position 0.)
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn queue_guard_confirms_queued_track_from_normalized_event_id() {
+    use crate::infra::queue::QueueNowPlaying;
+    let (tx, _rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    app.queue_now = Some(QueueNowPlaying::Spotify {
+      track: queue_track(Some("spotify:track:queued"), "Queued"),
+    });
+
+    let playing_uri = "spotify:track:queued".to_string();
+    assert_eq!(
+      app.spotify_queue_guard_reload_uri(base62_id_of(&playing_uri)),
+      None,
+      "the queued track's own TrackChanged must not trigger a reload"
+    );
   }
 
   /// When the native queue slot owns playback, `next_track` advances the queue

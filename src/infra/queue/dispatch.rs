@@ -688,6 +688,7 @@ async fn resume_or_finish(app: &Arc<Mutex<App>>) {
     Some(SuspendedContext::SpotifyShuffled {
       resume_index,
       generation,
+      ..
     }) => {
       // The network handler reloads the session's app-owned track list at the
       // resume index — same order, no refetch, no reshuffle. Stop the decoded
@@ -1059,6 +1060,8 @@ mod tests {
     app.lock().await.queue_suspended = Some(SuspendedContext::SpotifyShuffled {
       resume_index: Some(2),
       generation: 7,
+      context_uri: None,
+      resume_track_uri: None,
     });
 
     assert!(route_queue_event(&app, &IoEvent::AdvanceNativeQueue).await);
@@ -1084,6 +1087,8 @@ mod tests {
     app.lock().await.queue_suspended = Some(SuspendedContext::SpotifyShuffled {
       resume_index: None,
       generation: 4,
+      context_uri: None,
+      resume_track_uri: None,
     });
 
     assert!(route_queue_event(&app, &IoEvent::AdvanceNativeQueue).await);
