@@ -1409,6 +1409,16 @@ pub struct App {
   /// Horizontal scroll offset for the input box, computed during rendering.
   pub input_scroll_offset: Cell<u16>,
   pub liked_song_ids_set: HashSet<String>,
+  /// Liked-state lookups pending for the detached contains worker, as bare
+  /// base62 track ids (deduped). The `CurrentUserSavedTracksContains` handler
+  /// enqueues here instead of resolving on the serial IoEvent pump.
+  pub liked_lookup_pending: HashSet<String>,
+  /// Whether the single detached liked-lookup worker is currently draining
+  /// [`Self::liked_lookup_pending`].
+  pub liked_lookup_worker_running: bool,
+  /// Bumped on every local like/unlike so a detached liked-state read that
+  /// started before the mutation is re-read instead of clobbering it.
+  pub liked_state_epoch: u64,
   pub followed_artist_ids_set: HashSet<String>,
   pub saved_album_ids_set: HashSet<String>,
   pub saved_show_ids_set: HashSet<String>,
@@ -1864,6 +1874,9 @@ impl Default for App {
         selected_index: 0,
       },
       liked_song_ids_set: HashSet::new(),
+      liked_lookup_pending: HashSet::new(),
+      liked_lookup_worker_running: false,
+      liked_state_epoch: 0,
       followed_artist_ids_set: HashSet::new(),
       saved_album_ids_set: HashSet::new(),
       saved_show_ids_set: HashSet::new(),
@@ -4555,7 +4568,27 @@ impl App {
         crate::core::plugin_api::PlayableInfo::Track(t) => t.uri.clone(),
         crate::core::plugin_api::PlayableInfo::Episode(e) => e.uri.clone(),
       });
-    (context_uri, resume_track_uri)
+    if context_uri.is_some() || resume_track_uri.is_some() {
+      return (context_uri, resume_track_uri);
+    }
+    // Restored/direct-loaded playback has no server-side context and often an
+    // empty mirror queue, which used to snapshot `(None, None)` and dead-end
+    // the queue drain in "Queue finished" (no active playback after a queued
+    // song). The recovery snapshot still knows what was playing; consult it
+    // here, synchronously at suspend time, because the queued track's own
+    // direct load moves the recovery observer afterwards.
+    let Some(snapshot) = self.native_playback_recovery.as_ref() else {
+      return (None, None);
+    };
+    let next_track_uri = snapshot
+      .current_track_uri
+      .as_deref()
+      .and_then(|current| snapshot.next_raw_list_request(current))
+      .and_then(|request| {
+        let index = request.offset?;
+        request.uris?.into_iter().nth(index)
+      });
+    (snapshot.context_uri.clone(), next_track_uri)
   }
 
   /// Convert a shuffled queue suspension into a context snapshot. Called when
@@ -8822,6 +8855,52 @@ mod tests {
     match app.queue_suspended {
       Some(SuspendedContext::Spotify { context_uri, .. }) => {
         assert_eq!(context_uri.as_deref(), Some("spotify:playlist:ctx"));
+      }
+      other => panic!("expected a context suspension, got {other:?}"),
+    }
+  }
+
+  /// Restored/direct-loaded playback has no live context and no mirror queue;
+  /// the suspend fallback consults the recovery snapshot so the queue drain
+  /// resumes the next raw-list track instead of dead-ending in "Queue
+  /// finished" (observed as "No active playback" after a queued song).
+  #[cfg(feature = "streaming")]
+  #[test]
+  fn empty_live_state_suspension_falls_back_to_the_recovery_snapshot() {
+    use crate::core::queue::SuspendedContext;
+    let (tx, _rx) = channel();
+    let mut app = App::new(tx, UserConfig::new(), Some(SystemTime::now()));
+    app.native_playback_recovery = Some(NativePlaybackRecoverySnapshot {
+      generation: 1,
+      context_uri: None,
+      uris: Some(vec![
+        "spotify:track:a".to_string(),
+        "spotify:track:b".to_string(),
+        "spotify:track:c".to_string(),
+      ]),
+      offset: Some(0),
+      current_track_uri: Some("spotify:track:a".to_string()),
+      loading_track_uri: None,
+      position_ms: 0,
+      desired_playing: true,
+      shuffle: false,
+      repeat: RepeatState::Off,
+      recovery_attempts: 0,
+    });
+
+    app.suspend_native_spotify_context_for_queue(crate::infra::queue::SuspendCause::AutoAdvance);
+
+    match app.queue_suspended {
+      Some(SuspendedContext::Spotify {
+        context_uri,
+        resume_track_uri,
+      }) => {
+        assert_eq!(context_uri, None);
+        assert_eq!(
+          resume_track_uri.as_deref(),
+          Some("spotify:track:b"),
+          "the drain must resume the track after the one that was playing"
+        );
       }
       other => panic!("expected a context suspension, got {other:?}"),
     }
