@@ -5303,12 +5303,14 @@ impl App {
   /// Pause native streaming playback with the full bookkeeping the pause
   /// branch of [`toggle_playback`](Self::toggle_playback) does: clear any
   /// parked StartPlayback and the load watchdog (either would resume or force
-  /// recovery against a backend we just gave up on), pause the player, and
-  /// flip the UI playing state.
+  /// recovery against a backend we just gave up on), mark the playback intent
+  /// as paused (so a recovery snapshot doesn't resume into that backend
+  /// either), pause the player, and flip the UI playing state.
   #[cfg(feature = "streaming")]
   pub fn pause_native_playback(&mut self) {
     self.pending_start_playback = None;
     self.native_load_watchdog = None;
+    self.set_native_playback_intent(false);
     if let Some(player) = &self.streaming_player {
       player.pause();
     }
@@ -5417,15 +5419,7 @@ impl App {
           if is_playing { "paused" } else { "playing" }
         );
         if is_playing {
-          self.pending_start_playback = None;
-          self.native_load_watchdog = None;
-          self.set_native_playback_intent(false);
-          player.pause();
-          // Update UI state immediately
-          if let Some(ctx) = &mut self.current_playback_context {
-            ctx.is_playing = false;
-          }
-          self.native_is_playing = Some(false);
+          self.pause_native_playback();
         } else {
           self.set_native_playback_intent(true);
           player.play();
