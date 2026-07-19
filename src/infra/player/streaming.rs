@@ -453,9 +453,16 @@ impl RecoveringSink {
 impl audio_backend::Sink for RecoveringSink {
   fn start(&mut self) -> audio_backend::SinkResult<()> {
     self.failed = false;
-    if let Err(err) = self.with_inner("start", |sink| sink.start()) {
-      *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
-      self.failed = true;
+    match self.with_inner("start", |sink| sink.start()) {
+      Ok(()) => {
+        // A working sink supersedes any stale error recorded before there was
+        // a player to surface it; leaving it would report a live failure later.
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+      }
+      Err(err) => {
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
+        self.failed = true;
+      }
     }
     // A sink error must not invalidate librespot's player thread. Keep consuming
     // packets silently so the TUI can surface the failure and remain usable.
@@ -1318,9 +1325,76 @@ fn new_device_id_string() -> String {
 mod tests {
   use super::{
     get_or_create_device_id, new_device_id_string, should_retry_with_fresh_credentials,
-    wait_for_oauth_callback_port, StreamingConnectionState,
+    wait_for_oauth_callback_port, RecoveringSink, StreamingConnectionState,
   };
+  use librespot_playback::{audio_backend, convert::Converter, decoder::AudioPacket};
+  use std::sync::Arc;
   use std::time::Duration;
+
+  struct StubSink {
+    start_result: fn() -> audio_backend::SinkResult<()>,
+  }
+
+  impl audio_backend::Sink for StubSink {
+    fn start(&mut self) -> audio_backend::SinkResult<()> {
+      (self.start_result)()
+    }
+
+    fn stop(&mut self) -> audio_backend::SinkResult<()> {
+      Ok(())
+    }
+
+    fn write(
+      &mut self,
+      _packet: AudioPacket,
+      _converter: &mut Converter,
+    ) -> audio_backend::SinkResult<()> {
+      Ok(())
+    }
+  }
+
+  fn failing_start() -> audio_backend::SinkResult<()> {
+    Err(audio_backend::SinkError::StateChange(
+      "stub backend failure".to_string(),
+    ))
+  }
+
+  fn stub_recovering_sink(
+    start_result: fn() -> audio_backend::SinkResult<()>,
+  ) -> (RecoveringSink, Arc<std::sync::Mutex<Option<String>>>) {
+    let error = Arc::new(std::sync::Mutex::new(None));
+    let sink = RecoveringSink::new(
+      move || Box::new(StubSink { start_result }) as Box<dyn audio_backend::Sink>,
+      Arc::clone(&error),
+    );
+    (sink, error)
+  }
+
+  #[test]
+  fn failing_backend_start_returns_ok_and_records_error() {
+    use audio_backend::Sink;
+
+    let (mut sink, error) = stub_recovering_sink(failing_start);
+
+    // The regression guard for #384: a failing backend must not propagate the
+    // error into librespot's player thread.
+    sink.start().expect("start() must fail softly");
+    assert!(sink.failed);
+    let recorded = error.lock().unwrap().take();
+    assert!(recorded.unwrap().contains("stub backend failure"));
+  }
+
+  #[test]
+  fn successful_start_clears_stale_backend_error() {
+    use audio_backend::Sink;
+
+    let (mut sink, error) = stub_recovering_sink(|| Ok(()));
+    *error.lock().unwrap() = Some("stale error from a previous sink".to_string());
+
+    sink.start().expect("start() should succeed");
+    assert!(!sink.failed);
+    assert!(error.lock().unwrap().is_none());
+  }
 
   #[test]
   fn oauth_callback_port_waits_for_previous_listener_to_release() {
